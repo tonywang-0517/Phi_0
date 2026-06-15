@@ -16,10 +16,11 @@ experiments/
 
 # Large media / arrays
 *.gif
+!assets/*.gif
 *.mp4
 *.npy
 *.npz
-skeleton_animation.gif
+/skeleton_animation.gif
 
 # Logs & run artifacts
 *.log
