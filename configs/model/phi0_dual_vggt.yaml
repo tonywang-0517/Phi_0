@@ -1,0 +1,15 @@
+# Phi_0 + dual cross-attn: even layers Cosmos hook, odd layers VGGT scene registers.
+# Inherits phi0_full; override ablation mode and enable frozen VGGT tower.
+
+defaults:
+  - phi0_full
+  - _self_
+
+action_dit_config:
+  action_cross_attn_mode: dual_cosmos_vggt
+
+vggt:
+  enabled: true
+  checkpoint_path: /mnt/data2/wpy/workspace/vggt-omega/checkpoints/vggt_omega_1b_512.pt
+  image_resolution: 512
+  freeze: true

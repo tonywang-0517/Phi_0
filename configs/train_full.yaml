@@ -1,0 +1,56 @@
+# @package _global_
+
+defaults:
+  - _self_
+  - model: phi0_dual_vggt  # default: ACT + dual Cosmos/VGGT cross-attn
+
+output_dir: ./experiments/phi0_full
+checkpoint_name: phi0_full
+checkpoints_dir: ./checkpoints
+fastwam_ckpt: null
+resume_ckpt: null
+batch_size: 4  # doubled from smoke default 2
+num_workers: 2  # match GPU-bound training; 4 workers oversubscribes CPU with tokenizer/VAE main thread
+prefetch_factor: 2
+gradient_clipping: 1.0
+repeated_action_steps: 4  # DiT4DiT-style: repeat action batch after one Cosmos hook forward
+compile_action_expert: false  # optional: torch.compile action FM head (PyTorch 2.x, CUDA)
+learning_rate: 1.0e-5
+learning_rate_backbone: 1.0e-5   # Cosmos DiT transformer (DiT4DiT backbone_interface)
+learning_rate_action: 1.5e-4     # Action AR DiT (sqrt-scaled 1e-4 * sqrt(2) for batch 2→4)
+weight_decay: 0.0
+max_steps: 20
+save_every_steps: 0
+checkpoint_overwrite: true
+save_action_expert_only: true
+save_optimizer: false  # only needed to resume training with exact Adam state
+mixed_precision: bf16
+device: cuda
+smoke_action_only: false
+
+data:
+  # Unified control timeline (DiT4DiT-style video subsampling for Cosmos).
+  control_fps: 20.0
+  action_video_freq_ratio: 2  # Cosmos video: every Nth control step (pixel space)
+  dataset_native_fps:
+    xperience: 20.0
+    egodex: 30.0
+  clip_stride: 1
+  # seq_len = control steps at control_fps; 33 steps @ 20Hz ≈ 1.65s wall time for all datasets.
+  seq_len: 33
+  xperience_max_frames: 256
+  egodex_max_frames: 256
+  xperience_video: null  # auto: stereo_left.mp4 (mono left eye)
+  normalize: true
+  # z-score stats: null = auto compute to output_dir/action_stats.json on first train
+  action_stats_path: ./checkpoints/phi0_action_stats.json
+  auto_compute_action_stats: true
+  mono_camera: true
+  cache_video: true  # preload MP4 once; removes per-frame cv2 open/seek
+
+hydra:
+  job:
+    chdir: false
+  run:
+    dir: .
+  output_subdir: null

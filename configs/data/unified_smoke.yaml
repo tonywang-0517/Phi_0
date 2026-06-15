@@ -1,0 +1,14 @@
+# Mixed Xperience + EgoDex smoke dataset (mono left video + language prompts)
+# @package data
+
+seq_len: 5
+control_fps: 20.0
+action_video_freq_ratio: 2
+dataset_native_fps:
+  xperience: 20.0
+  egodex: 30.0
+xperience_max_frames: 16
+egodex_max_frames: 16
+xperience_video: null  # auto-resolve stereo_left.mp4
+normalize: true
+mono_camera: true

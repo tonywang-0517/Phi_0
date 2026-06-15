@@ -1,0 +1,16 @@
+# @package _global_
+# ACT + proprio, 400 steps, optimizer saved for resume.
+
+defaults:
+  - train_full
+  - _self_
+
+output_dir: ./experiments/phi0_act_proprio_400step
+checkpoint_name: phi0_act_proprio_400step
+max_steps: 400
+save_every_steps: 100
+checkpoint_overwrite: true
+save_optimizer: true
+
+model:
+  action_head: act

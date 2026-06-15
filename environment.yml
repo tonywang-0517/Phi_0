@@ -1,0 +1,33 @@
+# Conda env for Phi_0 — align with FastWAM + DiT4DiT patterns.
+#
+# Quick setup (CPU smoke / dev):
+#   conda create -n Phi-0-wpy python=3.10 -y
+#   conda activate Phi-0-wpy
+#   pip install -U pip
+#   pip install torch torchvision --index-url https://download.pytorch.org/whl/cpu
+#   pip install -e /mnt/data1/wpy/workspace/FastWAM --no-deps
+#   pip install -e /mnt/data1/wpy/workspace/Phi_0[train,viz]
+#   pip install accelerate av einops h5py hydra-core imageio imageio-ffmpeg \
+#       omegaconf opencv-python rich scipy tqdm transformers diffusers huggingface-hub
+#
+# GPU training (CUDA 12.8, match FastWAM):
+#   pip install torch==2.7.1+cu128 torchvision==0.22.1+cu128 \
+#       --extra-index-url https://download.pytorch.org/whl/cu128
+#   pip install -e /mnt/data1/wpy/workspace/FastWAM
+#   pip install -e /mnt/data1/wpy/workspace/Phi_0[train,viz]
+#
+# Verify:
+#   conda run -n Phi-0-wpy bash -c 'cd /mnt/data1/wpy/workspace/Phi_0 && \
+#     PYTHONPATH=src:/mnt/data1/wpy/workspace/FastWAM/src python scripts/smoke_test.py'
+
+name: Phi-0-wpy
+channels:
+  - conda-forge
+  - defaults
+dependencies:
+  - python=3.10
+  - pip
+  - ffmpeg
+  - h5py
+  - numpy=1.26.*
+  - scipy

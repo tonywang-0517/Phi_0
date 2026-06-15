@@ -1,0 +1,11 @@
+# @package _global_
+# Resume ACT+proprio 400step -> train to 800 steps.
+
+defaults:
+  - train_act_proprio_400
+  - _self_
+
+output_dir: ./experiments/phi0_act_proprio_800step
+checkpoint_name: phi0_act_proprio_800step
+max_steps: 800
+resume_ckpt: ./experiments/phi0_act_proprio_400step/phi0_act_proprio_400step_latest.pt

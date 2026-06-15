@@ -1,0 +1,45 @@
+# Secrets
+.env
+
+# Model weights & checkpoints
+*.pt
+*.pth
+*.safetensors
+checkpoints/
+
+# Datasets & body models
+/data/
+.download_cache/
+
+# Experiment outputs (logs, ckpt, viz)
+experiments/
+
+# Large media / arrays
+*.gif
+*.mp4
+*.npy
+*.npz
+skeleton_animation.gif
+
+# Logs & run artifacts
+*.log
+*.out
+nohup.out
+train.log
+download_logs/
+
+# Deploy / viz outputs
+viz_out/
+viz_action_*/
+*.jsonl
+
+# Python
+__pycache__/
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# IDE
+.vscode/
+.idea/

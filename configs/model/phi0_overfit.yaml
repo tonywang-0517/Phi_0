@@ -1,0 +1,40 @@
+# CPU smoke / overfit: no Cosmos download
+base_model: null
+revision: diffusers/base/post-trained
+local_files_only: true
+prompt_max_length: 128
+load_text_encoder: false
+load_transformer: false
+# Legacy smoke-only: num_context_tokens applies to SmokeVideoTower stub (not Cosmos production path).
+num_context_tokens: 16
+freeze_video_tower: true
+raw_action_dim: 256
+
+action_head: fm  # fm | act
+action_context_mode: full_clip
+past_action_window_size: 2
+
+action_dit_config:
+  hidden_dim: 1024
+  ffn_dim: 4096
+  num_heads: 4
+  attn_head_dim: 128
+  num_layers: 2
+  text_dim: 512
+  freq_dim: 256
+  eps: 1.0e-06
+  use_gradient_checkpointing: false
+  interleave_self_attention: true
+  add_pos_embed: true
+
+action_fm:
+  noise_beta_alpha: 1.5
+  noise_beta_beta: 1.0
+  noise_s: 0.999
+  num_timestep_buckets: 1000
+  num_inference_timesteps: 4
+
+loss:
+  lambda_video: 0.0
+  lambda_action: 1.0
+  lambda_bone: 0.1

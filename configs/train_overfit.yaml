@@ -1,0 +1,22 @@
+# @package _global_
+
+defaults:
+  - _self_
+  - model: phi0_overfit
+  - data: unified_smoke
+
+output_dir: ./experiments/overfit_smoke
+batch_size: 1
+num_workers: 0
+learning_rate: 1.0e-4
+max_steps: 2
+mixed_precision: "no"
+device: cpu
+smoke_action_only: true
+
+hydra:
+  job:
+    chdir: false
+  run:
+    dir: .
+  output_subdir: null

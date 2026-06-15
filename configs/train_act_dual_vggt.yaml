@@ -1,0 +1,18 @@
+# @package _global_
+# ACT + proprio + dual_cosmos_vggt, 800 steps from scratch (vs phi0_act_proprio_800step baseline).
+
+defaults:
+  - train_full
+  - override /model: phi0_dual_vggt
+  - _self_
+
+output_dir: ./experiments/phi0_act_dual_vggt_800step
+checkpoint_name: phi0_act_dual_vggt_800step
+max_steps: 800
+save_every_steps: 100
+checkpoint_overwrite: true
+save_optimizer: true
+resume_ckpt: null
+
+model:
+  action_head: act

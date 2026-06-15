@@ -1,0 +1,67 @@
+# Full Phi_0: Cosmos-Predict2.5-2B (DiT4DiT joint) + ACT action (hook cross-attn)
+base_model: null
+revision: diffusers/base/post-trained
+local_files_only: true
+prompt_max_length: 512
+load_text_encoder: true
+load_transformer: true
+extract_layer: 17  # DiT4DiT default (framework.cosmos25.extract_layer)
+# DiT4DiT default: freeze text+VAE, fine-tune Cosmos DiT transformer
+freeze_text_encoder: true
+freeze_vae: true
+freeze_transformer: true  # action-only (lambda_video=0): freeze Cosmos; set false for joint DiT4DiT FT
+# Legacy override: set true to freeze entire video tower (text+vae+transformer)
+freeze_video_tower: null
+detach_action_context: true
+# Cosmos: multi-frame latent clip for action hook (DiT4DiT-style video history).
+action_context_mode: full_clip  # first_frame | full_clip
+past_action_window_size: 4  # proprio prefix: past normalized actions (history output)
+# Deterministic Cosmos capture (sigma=0) for train/eval/deploy reproducibility.
+capture_stochastic: false
+# VAE encode: mode/mean instead of sample for deterministic latents.
+vae_sample: false
+conditional_frame_timestep: 0.0001
+# Dual forward uses single DiT pass when lambda_video>0; GC off for speed (needs ~40GB+ VRAM batch=1).
+enable_cosmos_gradient_checkpointing: false
+raw_action_dim: 256
+
+# Action: DiT4DiT-style chunk prediction with proprio prefix + multi-frame Cosmos hook
+action_head: act  # act (default) | fm (legacy flow matching)
+
+action_dit_config:
+  hidden_dim: 1024
+  ffn_dim: 4096
+  num_heads: 16
+  attn_head_dim: 128
+  num_layers: 16  # DiT4DiT DiT-B default (diffusion_model_cfg.num_layers)
+  text_dim: 2048  # overwritten: Cosmos hook dim (16*128)
+  freq_dim: 256
+  eps: 1.0e-06
+  use_gradient_checkpointing: false
+  # Cross-attn ablation: interleave_cosmos (baseline) | dual_cosmos_vggt | all_cosmos
+  action_cross_attn_mode: interleave_cosmos
+  add_pos_embed: true
+
+action_fm:
+  noise_beta_alpha: 1.5
+  noise_beta_beta: 1.0
+  noise_s: 0.999
+  num_timestep_buckets: 1000
+  num_inference_timesteps: 4
+
+loss:
+  lambda_video: 0.0
+  lambda_action: 1.0
+  lambda_bone: 0.5
+  lambda_bone_hand: 0.5  # extra hand/finger bone-length loss (child joints 22–51)
+  lambda_bone_dir: 0.3
+  lambda_hand_mse: 0.5  # extra masked MSE on hand keypoints (joints 22–51)
+
+# VGGT-Omega scene registers (odd-layer cross-attn when action_cross_attn_mode=dual_cosmos_vggt)
+vggt:
+  enabled: false
+  checkpoint_path: /mnt/data2/wpy/workspace/vggt-omega/checkpoints/vggt_omega_1b_512.pt
+  image_resolution: 512
+  freeze: true
+
+# Video: DiT4DiT latent future rectified-flow (updates Cosmos transformer; hook detached for action)
