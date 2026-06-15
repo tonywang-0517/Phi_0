@@ -1,4 +1,4 @@
-# Phi_0
+# φ-0
 
 单目 egocentric 视频 + 语言 → **未来 action chunk** 的世界-动作模型。视频侧 [Cosmos-Predict2.5-2B](https://huggingface.co/nvidia/Cosmos-Predict2.5-2B)（DiT4DiT 风格 hook）；动作侧 16 层 Action DiT（**ACT** 直接回归 或 **FM** flow matching），固定 **256-d** I/O，**仅监督 keypoints 156-d**。
 
@@ -7,7 +7,7 @@
 ## 模型架构
 
 <p align="center">
-  <img src="assets/1280X1280.PNG" alt="Phi_0 三塔架构" width="90%">
+  <img src="assets/1280X1280.PNG" alt="φ-0 三塔架构" width="90%">
 </p>
 
 **三塔结构**：Cosmos 视频塔（VAE + DiT hook）提供视觉-语言 context；可选 VGGT-Omega 塔提供 3D 场景 register；Action DiT 塔通过交替 cross-attention 融合 context，一次前向预测未来 29 步动作 chunk（proprio 前缀 4 步 + future 29 步）。
@@ -34,7 +34,7 @@ Cross-attn 模式（`action_cross_attn_mode`）：
 `phi0_act_proprio_800step`（Cosmos 双塔 + ACT + proprio）在 Xperience demo 上的 skeleton 预测可视化（绿=GT，蓝=Pred）：
 
 <p align="center">
-  <img src="assets/skeleton_animation.gif" alt="Phi_0 800 step eval skeleton animation" width="90%">
+  <img src="assets/skeleton_animation.gif" alt="φ-0 800 step eval skeleton animation" width="90%">
 </p>
 
 ---
@@ -88,7 +88,7 @@ rsync -av --progress cluster_0:/mnt/data2/wpy/workspace/ /your/local/workspace/
 
 | 路径 | 内容 |
 |------|------|
-| `Phi_0/` | 本仓库源码 |
+| `Phi_0/` | φ-0 本仓库源码（目录名仍为 `Phi_0`） |
 | `Phi_0/checkpoints/` | Cosmos-Predict2.5-2B、action stats 等 |
 | `Phi_0/experiments/` | 各实验 checkpoint（如 `phi0_act_proprio_800step_latest.pt`） |
 | `vggt-omega/checkpoints/` | VGGT-Omega 权重 |
@@ -223,7 +223,7 @@ loss = λ_a · MSE_action + λ_bone · L_bone + λ_bone_hand · L_hand_bone
 ## 目录
 
 ```
-Phi_0/
+Phi_0/                                # 仓库根目录（φ-0）
 ├── assets/                           # README 展示图（架构图、eval 动图）
 ├── configs/
 │   ├── model/phi0_full.yaml          # 双塔基线
