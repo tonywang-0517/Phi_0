@@ -1,7 +1,7 @@
 # Mixed Xperience + EgoDex smoke dataset (mono left video + language prompts)
 # @package data
 
-seq_len: 5
+seq_len: 4  # 2-step proprio + 2-step future (matches past_action_window_size=2)
 control_fps: 20.0
 action_video_freq_ratio: 2
 dataset_native_fps:

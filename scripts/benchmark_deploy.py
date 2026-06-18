@@ -19,7 +19,11 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
 from phi0.checkpoint_utils import merge_saved_cfg
-from phi0.data.processor import Phi0Processor
+from phi0.data.dit4dit_video import dit4dit_preprocess_frame
+from phi0.data.cosmos_video_size import (
+    cosmos_video_size_from_cfg,
+    round_hw_to_multiple,
+)
 from phi0.data.temporal_align import (
     DEFAULT_DATASET_NATIVE_FPS,
     native_span_frames,
@@ -35,6 +39,7 @@ from phi0.inference.session import ActionInferenceSession, PromptEmbedCache, res
 from phi0.runtime import (
     activate_cuda_device,
     apply_processor_stats_from_checkpoint,
+    build_processor,
     create_phi0,
     resolve_inference_device,
     sync_model_action_norm,
@@ -79,7 +84,7 @@ def parse_args():
         "--action-chunk-size",
         type=int,
         default=None,
-        help="Deploy predict horizon per forward (default: seq_len - past_action_window_size)",
+        help="Deploy predict horizon per forward (default: seq_len - action_history_window)",
     )
     return p.parse_args()
 
@@ -113,15 +118,26 @@ def main():
     ckpt = Path(args.checkpoint)
     payload = torch.load(ckpt, map_location="cpu", weights_only=False)
     if isinstance(payload, dict) and "cfg" in payload:
-        cfg = merge_saved_cfg(cfg, payload["cfg"])
+        try:
+            cfg = merge_saved_cfg(cfg, payload["cfg"])
+        except Exception as exc:
+            print(
+                f"Warning: merge_saved_cfg failed ({exc}); using base config {args.config_name}",
+                file=sys.stderr,
+            )
     cfg.device = device
+    cosmos_hw = cosmos_video_size_from_cfg(cfg.data)
+    cosmos_h, cosmos_w = round_hw_to_multiple(*cosmos_hw)
+    crop_scale = cfg.data.get("cosmos_video_crop_scale")
+    if crop_scale is not None:
+        crop_scale = float(crop_scale)
 
     deploy_fps = float(
         args.deploy_fps if args.deploy_fps is not None else cfg.data.get("control_fps", 20.0)
     )
     native_fps = _resolve_native_fps(cfg, None)
     video_ratio = int(cfg.data.get("action_video_freq_ratio", 2))
-    seq_len = int(cfg.data.get("seq_len", 33))
+    seq_len = int(cfg.data.get("seq_len", 58))
     num_frames = int(args.num_frames) if args.num_frames is not None else max(
         1, int(round(float(args.deploy_seconds) * deploy_fps))
     )
@@ -141,7 +157,7 @@ def main():
     model.eval()
     load_s = time.perf_counter() - t0
 
-    processor = Phi0Processor(normalize=True).eval()
+    processor = build_processor(cfg).eval()
     if isinstance(payload, dict):
         apply_processor_stats_from_checkpoint(processor, payload, cfg)
     sync_model_action_norm(model, processor)
@@ -150,6 +166,7 @@ def main():
         max_frames=start_frame + native_span,
         start_frame=0,
         cache_video=True,
+        image_size=(cosmos_h, cosmos_w),
     )
 
     session = ActionInferenceSession(
@@ -157,29 +174,35 @@ def main():
         processor=processor,
         deploy_seq_len=seq_len,
         action_video_freq_ratio=video_ratio,
-        use_gt_proprio=True,
+        use_gt_history=True,
     )
     action_chunk = (
         int(args.action_chunk_size)
         if args.action_chunk_size is not None
         else resolve_deploy_action_chunk_size(model, seq_len=seq_len)
     )
-    proprio_w = int(getattr(model, "past_action_window_size", 0))
+    history_w = int(getattr(model, "past_action_window_size", 4))
     prompt_cache = PromptEmbedCache()
 
     def _read_chw(control_t: int) -> torch.Tensor:
         native_t = _control_to_native_frame(control_t, start_frame, deploy_fps, native_fps)
         if xp._video_frames is not None and 0 <= native_t < len(xp._video_frames):
-            return xp._video_frames[native_t]
-        cap = cv2.VideoCapture(args.input_video)
-        cap.set(cv2.CAP_PROP_POS_FRAMES, int(native_t))
-        ok, bgr = cap.read()
-        cap.release()
-        if not ok:
-            raise RuntimeError(f"Cannot read native frame {native_t} from {args.input_video}")
-        rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
-        rgb = cv2.resize(rgb, (640, 480))
-        return torch.from_numpy(rgb).permute(2, 0, 1).float() / 255.0
+            frame = xp._video_frames[native_t]
+        else:
+            cap = cv2.VideoCapture(args.input_video)
+            cap.set(cv2.CAP_PROP_POS_FRAMES, int(native_t))
+            ok, bgr = cap.read()
+            cap.release()
+            if not ok:
+                raise RuntimeError(f"Cannot read native frame {native_t} from {args.input_video}")
+            rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
+            rgb = cv2.resize(rgb, (cosmos_w, cosmos_h), interpolation=cv2.INTER_LINEAR)
+            frame = torch.from_numpy(rgb).permute(2, 0, 1).float() / 255.0
+        return dit4dit_preprocess_frame(
+            frame,
+            size=(cosmos_h, cosmos_w),
+            crop_scale=crop_scale,
+        )
 
     def _gt_action_norm(control_t: int) -> torch.Tensor:
         native_t = _control_to_native_frame(control_t, start_frame, deploy_fps, native_fps)
@@ -192,7 +215,7 @@ def main():
             _read_chw,
             seq_len=seq_len,
             action_video_freq_ratio=video_ratio,
-            past_window=proprio_w,
+            past_window=history_w,
             device=model.device,
             dtype=model.torch_dtype,
         )
@@ -220,9 +243,9 @@ def main():
             if device.startswith("cuda"):
                 torch.cuda.synchronize()
             refresh_times.append(time.perf_counter() - tr)
-        if proprio_w > 0:
-            proprio_ctrl = deploy_proprio_control_indices(seg_start, proprio_w)
-            session.set_proprio_gt(torch.stack([_gt_action_norm(c) for c in proprio_ctrl], dim=0))
+        if history_w > 0:
+            history_ctrl = deploy_proprio_control_indices(seg_start, history_w)
+            session.set_history_gt(torch.stack([_gt_action_norm(c) for c in history_ctrl], dim=0))
         chunk_len = min(action_chunk, num_frames - seg_start)
         if device.startswith("cuda"):
             torch.cuda.synchronize()
@@ -260,6 +283,7 @@ def main():
     bench = {
         "checkpoint": str(ckpt),
         "checkpoint_step": int(payload.get("step", -1)) if isinstance(payload, dict) else -1,
+        "cosmos_video_size": [cosmos_h, cosmos_w],
         "device": str(device),
         "num_deploy_frames": num_frames,
         "deploy_seconds": round(num_frames / deploy_fps, 3),
@@ -274,8 +298,9 @@ def main():
         "deploy_video_clip_frames": len(
             deploy_subsampled_video_control_indices(0, seq_len=seq_len, action_video_freq_ratio=video_ratio)
         ),
-        "use_gt_proprio": True,
-        "proprio_window": proprio_w,
+        "use_gt_history": True,
+        "history_window": history_w,
+        "proprio_window": history_w,
         "video_refresh_interval_frames": refresh_every,
         "deploy_align": "training_clip_gt_proprio",
         "video_tower_refresh_count": session.video_refresh_count,

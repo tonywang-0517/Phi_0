@@ -13,6 +13,7 @@ from phi0.models.action_cross_attn import resolve_action_cross_attn_mode
 from phi0.models.action_fm_dit import ActionFMDiT
 from phi0.models.action_fm_scheduler import ActionFMConfig, ActionFlowMatching
 from phi0.models.cosmos.video_tower import CosmosVideoTower, SmokeVideoTower
+from phi0.models.cosmos.video_fm import VideoFMConfig
 from phi0.schema.draw_schema import D_RAW
 from phi0.losses.bone import (
     bone_direction_loss,
@@ -22,6 +23,12 @@ from phi0.losses.bone import (
 )
 from phi0.checkpoint_utils import load_action_expert_state_dict, load_model_state_dict
 from phi0.data.video_pad import apply_video_pad_replacement
+from phi0.models.action_history import (
+    history_to_flow_source,
+    split_history_future,
+    split_history_future_dim_pad,
+    split_history_future_pad,
+)
 from phi0.models.action_proprio import (
     split_proprio_future,
     split_proprio_future_dim_pad,
@@ -80,7 +87,11 @@ class Phi0(torch.nn.Module):
         prompt_max_length: int = 512,
         action_head: str = "fm",
         action_fm_config: ActionFMConfig | None = None,
-        past_action_window_size: int = 0,
+        past_action_window_size: int = 4,
+        action_history_window: int | None = None,
+        action_future_horizon: int | None = None,
+        vggt_use_full_video: bool = True,
+        infer_generate_video: bool = False,
     ):
         super().__init__()
         self.video_tower = video_tower
@@ -104,6 +115,20 @@ class Phi0(torch.nn.Module):
         self.loss_lambda_hand_mse = float(loss_lambda_hand_mse)
         self.prompt_max_length = int(prompt_max_length)
         self.past_action_window_size = int(past_action_window_size)
+        self.action_history_window = (
+            int(action_history_window) if action_history_window is not None else None
+        )
+        self.action_future_horizon = (
+            int(action_future_horizon)
+            if action_future_horizon is not None
+            else (
+                int(self.action_history_window)
+                if self.action_history_window is not None
+                else None
+            )
+        )
+        self.vggt_use_full_video = bool(vggt_use_full_video)
+        self.infer_generate_video = bool(infer_generate_video)
         self.repeated_action_steps = 1
         self.action_fm = (
             ActionFlowMatching(action_fm_config or ActionFMConfig())
@@ -113,6 +138,11 @@ class Phi0(torch.nn.Module):
         self.register_buffer("action_norm_mean", torch.zeros(D_RAW), persistent=False)
         self.register_buffer("action_norm_std", torch.ones(D_RAW), persistent=False)
         self.to(self.device)
+
+    def uses_history_action_input(self) -> bool:
+        """Ablation path: symmetric history window + dit4dit_prefix_query encoder."""
+        encoder = getattr(self.action_expert, "action_token_encoder", "linear")
+        return str(encoder).strip().lower() == "dit4dit_prefix_query"
 
     def set_action_norm_stats(
         self,
@@ -155,13 +185,20 @@ class Phi0(torch.nn.Module):
         vae_sample: bool = False,
         conditional_frame_timestep: float = 0.0001,
         enable_cosmos_gradient_checkpointing: bool = False,
+        cosmos_hook_early_exit: bool = True,
         prompt_max_length: int = 512,
-        past_action_window_size: int = 0,
+        past_action_window_size: int = 4,
+        action_history_window: int | None = None,
+        action_future_horizon: int | None = None,
+        vggt_use_full_video: bool = True,
         vggt_tower: Optional[nn.Module] = None,
+        infer_generate_video: bool = False,
+        video_fm_config: dict[str, Any] | None = None,
     ):
         del num_context_tokens
         if action_dit_config is None:
             raise ValueError("`action_dit_config` is required.")
+        video_fm = VideoFMConfig(**dict(video_fm_config or {}))
         video_tower = CosmosVideoTower.from_pretrained(
             device=device,
             torch_dtype=torch_dtype,
@@ -182,10 +219,29 @@ class Phi0(torch.nn.Module):
             vae_sample=vae_sample,
             conditional_frame_timestep=conditional_frame_timestep,
             enable_gradient_checkpointing=enable_cosmos_gradient_checkpointing,
+            hook_early_exit=bool(cosmos_hook_early_exit),
+            video_fm_config=video_fm,
         )
         action_cfg = dict(action_dit_config)
         action_cfg["text_dim"] = int(video_tower.action_context_dim)
-        action_cfg["proprio_window"] = int(past_action_window_size)
+        resolved_past_window = int(past_action_window_size)
+        encoder = str(action_cfg.get("action_token_encoder", "linear")).strip().lower()
+        if encoder == "dit4dit_prefix_query":
+            resolved_history = (
+                int(action_history_window)
+                if action_history_window is not None
+                else resolved_past_window
+            )
+            resolved_future_horizon = (
+                int(action_future_horizon)
+                if action_future_horizon is not None
+                else resolved_history
+            )
+            action_cfg.setdefault("action_future_horizon", resolved_future_horizon)
+        else:
+            action_cfg["proprio_window"] = resolved_past_window
+            resolved_history = None
+            resolved_future_horizon = None
         if video_tower.transformer is not None:
             tcfg = video_tower.transformer.config
             action_cfg.setdefault("num_layers", 16)
@@ -215,7 +271,11 @@ class Phi0(torch.nn.Module):
             prompt_max_length=prompt_max_length,
             action_head=action_head,
             action_fm_config=fm_cfg,
-            past_action_window_size=int(past_action_window_size),
+            past_action_window_size=resolved_past_window,
+            action_history_window=resolved_history,
+            action_future_horizon=resolved_future_horizon,
+            vggt_use_full_video=bool(vggt_use_full_video),
+            infer_generate_video=bool(infer_generate_video),
         )
 
     @staticmethod
@@ -282,8 +342,18 @@ class Phi0(torch.nn.Module):
 
         if cached_latents is not None:
             input_latents = cached_latents.to(device=self.device, dtype=self.torch_dtype, non_blocking=True)
-        elif self.loss_lambda_video > 0 or self.loss_lambda_action > 0:
+        elif self.loss_lambda_video > 0:
             input_latents = self._encode_video_latents(video)
+        elif self.loss_lambda_action > 0:
+            # Action-only: Cosmos hook encodes via forward_joint_step; avoid full-clip VAE here.
+            b, _, t, h, w = video.shape
+            lh, lw = h // self.video_tower.vae_scale_factor_spatial, w // self.video_tower.vae_scale_factor_spatial
+            lt = max(1, (t - 1) // self.video_tower.vae_scale_factor_temporal + 1)
+            input_latents = torch.zeros(
+                (b, self.video_tower.latent_channels, lt, lh, lw),
+                device=self.device,
+                dtype=self.torch_dtype,
+            )
         else:
             b, _, t, h, w = video.shape
             lh, lw = h // self.video_tower.vae_scale_factor_spatial, w // self.video_tower.vae_scale_factor_spatial
@@ -298,16 +368,39 @@ class Phi0(torch.nn.Module):
         context_mask = context_mask.to(device=self.device)
         action = action.to(device=self.device, dtype=self.torch_dtype)
 
+        vggt_video = sample.get("vggt_video")
+        if vggt_video is not None:
+            vggt_video = vggt_video.to(device=self.device, dtype=self.torch_dtype, non_blocking=True)
+            vggt_video = apply_video_pad_replacement(vggt_video, sample.get("image_is_pad"))
+
         return {
             "input_latents": input_latents,
             "video": video,
+            "vggt_video": vggt_video,
             "context": context,
             "context_mask": context_mask,
             "action": action,
             "action_is_pad": sample.get("action_is_pad"),
             "action_dim_is_pad": sample.get("action_dim_is_pad"),
             "image_is_pad": sample.get("image_is_pad"),
+            **{
+                key: sample[key]
+                for key in ("action_ctx", "action_ctx_mask", "vggt_ctx", "vggt_ctx_mask")
+                if key in sample
+            },
         }
+
+    def set_frozen_towers_eval(self) -> None:
+        """Keep frozen Cosmos/VGGT in eval while action_expert trains."""
+        vt = self.video_tower
+        for mod in (getattr(vt, "vae", None), getattr(vt, "text_encoder", None)):
+            if mod is not None:
+                mod.eval()
+        if getattr(vt, "transformer", None) is not None and getattr(vt, "freeze_transformer", False):
+            vt.transformer.eval()
+        if self.vggt_tower is not None:
+            self.vggt_tower.eval()
+        self.action_expert.train()
 
     def uses_dual_vggt_cross_attn(self) -> bool:
         return self.action_cross_attn_mode == "dual_cosmos_vggt"
@@ -349,8 +442,15 @@ class Phi0(torch.nn.Module):
             raise RuntimeError(
                 "dual_cosmos_vggt requires vggt_tower or precomputed vggt_ctx in inputs."
             )
-        video = video.to(device=self.device, dtype=self.torch_dtype)
-        return self.vggt_tower.extract_register_context(video)
+        vggt_video = video
+        if inputs is not None and inputs.get("vggt_video") is not None:
+            vggt_video = inputs["vggt_video"]
+        vggt_video = vggt_video.to(device=self.device, dtype=self.torch_dtype)
+        if vggt_video.ndim != 5:
+            raise ValueError(f"vggt_video must be [B,3,T,H,W], got {tuple(vggt_video.shape)}")
+        if not self.vggt_use_full_video:
+            vggt_video = vggt_video[:, :, -1:, :, :]
+        return self.vggt_tower.extract_register_context(vggt_video)
 
     def _resolve_action_context(
         self,
@@ -361,14 +461,25 @@ class Phi0(torch.nn.Module):
     ) -> tuple[torch.Tensor, torch.Tensor]:
         if inputs is not None and "action_ctx" in inputs and "action_ctx_mask" in inputs:
             return inputs["action_ctx"], inputs["action_ctx_mask"]
+        video = inputs.get("video") if inputs is not None else None
         if getattr(self.video_tower, "transformer", None) is not None:
+            if video is None:
+                raise ValueError("Cosmos action context requires inputs['video'] (DiT4DiT frame-0 cond).")
+            if video.ndim != 5:
+                raise ValueError(f"inputs['video'] must be [B,3,T,H,W], got {tuple(video.shape)}")
+            # Use current frame only for Cosmos action-context extraction.
+            video_current = video[:, :, -1:, :, :]
             _, action_ctx, action_ctx_mask = self.video_tower.forward_joint_step(
-                input_latents,
+                video_current,
                 prompt_embeds,
                 compute_video_loss=False,
             )
             return action_ctx, action_ctx_mask
-        return self.video_tower.extract_action_context(input_latents, prompt_embeds)
+        if video is None:
+            raise ValueError("extract_action_context requires video tensor.")
+        if video.ndim != 5:
+            raise ValueError(f"inputs['video'] must be [B,3,T,H,W], got {tuple(video.shape)}")
+        return self.video_tower.extract_action_context(video[:, :, -1:, :, :], prompt_embeds)
 
     @staticmethod
     def _dim_valid_mask(
@@ -423,6 +534,21 @@ class Phi0(torch.nn.Module):
         future_pad = split_proprio_future_pad(action_is_pad, w)
         future_dim_pad = split_proprio_future_dim_pad(action_dim_is_pad, w)
         return proprio, future, future_pad, future_dim_pad
+
+    def _action_history_future(
+        self,
+        action: torch.Tensor,
+        action_is_pad: Optional[torch.Tensor],
+        action_dim_is_pad: Optional[torch.Tensor] = None,
+    ) -> tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor]]:
+        if self.action_history_window is None:
+            raise RuntimeError("action_history_window is required for history-mode training.")
+        w = self.action_history_window
+        future_horizon = self.action_future_horizon
+        history, future = split_history_future(action, w, future_horizon=future_horizon)
+        future_pad = split_history_future_pad(action_is_pad, w)
+        future_dim_pad = split_history_future_dim_pad(action_dim_is_pad, w)
+        return history, future, future_pad, future_dim_pad
 
     def _predict_velocity(
         self,
@@ -492,7 +618,7 @@ class Phi0(torch.nn.Module):
             if compute_video or self.loss_lambda_action > 0:
                 if compute_video:
                     loss_video, action_ctx, action_ctx_mask = self.video_tower.forward_joint_step(
-                        input_latents,
+                        inputs["video"],
                         prompt_embeds,
                         compute_video_loss=True,
                     )
@@ -500,8 +626,11 @@ class Phi0(torch.nn.Module):
                 else:
                     with torch.inference_mode():
                         action_ctx, action_ctx_mask = self._resolve_action_context(
-                            input_latents, prompt_embeds
+                            input_latents, prompt_embeds, inputs=inputs
                         )
+                    # Clone so action_expert cross-attn embed can backprop (inference tensors cannot).
+                    action_ctx = action_ctx.detach().clone()
+                    action_ctx_mask = action_ctx_mask.detach().clone()
             else:
                 action_ctx = torch.zeros(
                     (input_latents.shape[0], 4, self.text_dim),
@@ -512,9 +641,17 @@ class Phi0(torch.nn.Module):
                     (input_latents.shape[0], 4), device=self.device, dtype=torch.bool
                 )
         else:
-            action_ctx, action_ctx_mask = self.video_tower.extract_action_context(input_latents, prompt_embeds)
+            action_ctx, action_ctx_mask = self.video_tower.extract_action_context(
+                inputs["video"], prompt_embeds
+            )
 
         vggt_ctx, vggt_ctx_mask = self._resolve_vggt_context(inputs["video"], inputs=inputs)
+
+        if "action_ctx" in inputs and (
+            not self.uses_dual_vggt_cross_attn() or inputs.get("vggt_ctx") is not None
+        ):
+            inputs.pop("video", None)
+            inputs.pop("vggt_video", None)
 
         repeats = max(1, int(getattr(self, "repeated_action_steps", 1)))
         action_ctx, action_ctx_mask, action, action_is_pad, action_dim_is_pad = (
@@ -530,48 +667,93 @@ class Phi0(torch.nn.Module):
 
         use_fp32_action = self.device.type == "cuda"
         with torch.autocast(device_type=self.device.type, dtype=torch.float32, enabled=use_fp32_action):
-            proprio, future_action, future_pad, future_dim_pad = self._action_proprio_future(
-                action, action_is_pad, action_dim_is_pad
-            )
-            if self.action_head == "act":
-                placeholder = torch.zeros_like(future_action)
-                pred_action = self._predict_action_chunk(
-                    placeholder,
-                    action_ctx,
-                    action_ctx_mask,
-                    context_emb=context_emb,
-                    vggt_context=vggt_ctx,
-                    vggt_context_mask=vggt_ctx_mask,
-                    vggt_context_emb=vggt_context_emb,
-                    proprio_tokens=proprio,
+            if self.uses_history_action_input():
+                history, future_action, future_pad, future_dim_pad = self._action_history_future(
+                    action, action_is_pad, action_dim_is_pad
                 )
-                loss_action = self._compute_action_loss(
-                    pred_action, future_action, future_pad, future_dim_pad
-                )
-                action_est = pred_action
+                if self.action_head == "act":
+                    pred_action = self._predict_action_chunk(
+                        history,
+                        action_ctx,
+                        action_ctx_mask,
+                        context_emb=context_emb,
+                        vggt_context=vggt_ctx,
+                        vggt_context_mask=vggt_ctx_mask,
+                        vggt_context_emb=vggt_context_emb,
+                    )
+                    loss_action = self._compute_action_loss(
+                        pred_action, future_action, future_pad, future_dim_pad
+                    )
+                    action_est = pred_action
+                else:
+                    batch_size = future_action.shape[0]
+                    flow_source = history_to_flow_source(history, future_action.shape[1])
+                    t_cont = self.action_fm.sample_training_t(
+                        batch_size, future_action.device, future_action.dtype
+                    )
+                    t_view = t_cont.view(-1, *([1] * (future_action.ndim - 1)))
+                    noisy_action = self.action_fm.corrupt(future_action, flow_source, t_cont)
+                    target_velocity = self.action_fm.training_target(future_action, flow_source)
+                    t_disc = self.action_fm.discretize_t(t_cont)
+                    pred_velocity = self._predict_velocity(
+                        noisy_action,
+                        t_disc,
+                        action_ctx,
+                        action_ctx_mask,
+                        context_emb=context_emb,
+                        vggt_context=vggt_ctx,
+                        vggt_context_mask=vggt_ctx_mask,
+                        vggt_context_emb=vggt_context_emb,
+                    )
+                    loss_action = self._compute_action_loss(
+                        pred_velocity, target_velocity, future_pad, future_dim_pad
+                    )
+                    action_est = noisy_action - t_view * pred_velocity
             else:
-                batch_size = future_action.shape[0]
-                noise = torch.randn_like(future_action)
-                t_cont = self.action_fm.sample_training_t(batch_size, future_action.device, future_action.dtype)
-                t_view = t_cont.view(-1, *([1] * (future_action.ndim - 1)))
-                noisy_action = self.action_fm.corrupt(future_action, noise, t_cont)
-                target_velocity = self.action_fm.training_target(future_action, noise)
-                t_disc = self.action_fm.discretize_t(t_cont)
-                pred_velocity = self._predict_velocity(
-                    noisy_action,
-                    t_disc,
-                    action_ctx,
-                    action_ctx_mask,
-                    context_emb=context_emb,
-                    vggt_context=vggt_ctx,
-                    vggt_context_mask=vggt_ctx_mask,
-                    vggt_context_emb=vggt_context_emb,
-                    proprio_tokens=proprio,
+                proprio, future_action, future_pad, future_dim_pad = self._action_proprio_future(
+                    action, action_is_pad, action_dim_is_pad
                 )
-                loss_action = self._compute_action_loss(
-                    pred_velocity, target_velocity, future_pad, future_dim_pad
-                )
-                action_est = noisy_action - t_view * pred_velocity
+                if self.action_head == "act":
+                    placeholder = torch.zeros_like(future_action)
+                    pred_action = self._predict_action_chunk(
+                        placeholder,
+                        action_ctx,
+                        action_ctx_mask,
+                        context_emb=context_emb,
+                        vggt_context=vggt_ctx,
+                        vggt_context_mask=vggt_ctx_mask,
+                        vggt_context_emb=vggt_context_emb,
+                        proprio_tokens=proprio,
+                    )
+                    loss_action = self._compute_action_loss(
+                        pred_action, future_action, future_pad, future_dim_pad
+                    )
+                    action_est = pred_action
+                else:
+                    batch_size = future_action.shape[0]
+                    noise = torch.randn_like(future_action)
+                    t_cont = self.action_fm.sample_training_t(
+                        batch_size, future_action.device, future_action.dtype
+                    )
+                    t_view = t_cont.view(-1, *([1] * (future_action.ndim - 1)))
+                    noisy_action = self.action_fm.corrupt(future_action, noise, t_cont)
+                    target_velocity = self.action_fm.training_target(future_action, noise)
+                    t_disc = self.action_fm.discretize_t(t_cont)
+                    pred_velocity = self._predict_velocity(
+                        noisy_action,
+                        t_disc,
+                        action_ctx,
+                        action_ctx_mask,
+                        context_emb=context_emb,
+                        vggt_context=vggt_ctx,
+                        vggt_context_mask=vggt_ctx_mask,
+                        vggt_context_emb=vggt_context_emb,
+                        proprio_tokens=proprio,
+                    )
+                    loss_action = self._compute_action_loss(
+                        pred_velocity, target_velocity, future_pad, future_dim_pad
+                    )
+                    action_est = noisy_action - t_view * pred_velocity
             loss_bone = bone_length_loss(
                 action_est,
                 future_action,
@@ -640,6 +822,7 @@ class Phi0(torch.nn.Module):
         vggt_context_mask: Optional[torch.Tensor] = None,
         vggt_context_emb: Optional[torch.Tensor] = None,
         proprio_tokens: Optional[torch.Tensor] = None,
+        history: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """Euler FM denoise: returns normalized actions [B, T, D]."""
         if self.action_head != "fm" or self.action_fm is None:
@@ -660,9 +843,16 @@ class Phi0(torch.nn.Module):
                 proprio_tokens=proprio_tokens,
             )
 
+        initial_state: Optional[torch.Tensor] = None
+        if self.uses_history_action_input():
+            if history is None:
+                raise ValueError("history is required for FM predict when uses_history_action_input=True")
+            initial_state = history_to_flow_source(history, int(num_frames))
+
         return self.action_fm.denoise_euler(
             _predict_velocity,
-            batch_size=batch_size,
+            initial_state=initial_state,
+            batch_size=int(batch_size),
             seq_len=int(num_frames),
             action_dim=self.action_expert.raw_action_dim,
             device=self.device,
@@ -682,8 +872,22 @@ class Phi0(torch.nn.Module):
         vggt_context_mask: Optional[torch.Tensor] = None,
         vggt_context_emb: Optional[torch.Tensor] = None,
         proprio_tokens: Optional[torch.Tensor] = None,
+        history: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """Direct regression: returns normalized actions [B, T, D]."""
+        if self.uses_history_action_input():
+            if history is None:
+                raise ValueError("history is required when uses_history_action_input=True")
+            pred = self._predict_action_chunk(
+                history,
+                action_context,
+                action_context_mask,
+                context_emb=context_emb,
+                vggt_context=vggt_context,
+                vggt_context_mask=vggt_context_mask,
+                vggt_context_emb=vggt_context_emb,
+            )
+            return pred[:, : int(num_frames)]
         placeholder = torch.zeros(
             batch_size,
             int(num_frames),
@@ -715,6 +919,7 @@ class Phi0(torch.nn.Module):
         vggt_context_mask: Optional[torch.Tensor] = None,
         vggt_context_emb: Optional[torch.Tensor] = None,
         proprio_tokens: Optional[torch.Tensor] = None,
+        history: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         if self.action_head == "act":
             return self.predict_action_act(
@@ -727,6 +932,7 @@ class Phi0(torch.nn.Module):
                 vggt_context_mask=vggt_context_mask,
                 vggt_context_emb=vggt_context_emb,
                 proprio_tokens=proprio_tokens,
+                history=history,
             )
         return self.predict_action_fm(
             action_context,
@@ -738,6 +944,35 @@ class Phi0(torch.nn.Module):
             vggt_context_mask=vggt_context_mask,
             vggt_context_emb=vggt_context_emb,
             proprio_tokens=proprio_tokens,
+            history=history,
+        )
+
+    @torch.no_grad()
+    def predict_video(
+        self,
+        video: torch.Tensor,
+        prompt_embeds: torch.Tensor,
+        *,
+        num_inference_steps: int | None = None,
+        num_pixel_frames_out: int | None = None,
+        num_frames_in: int | None = None,
+        seq_len: int | None = None,
+        action_video_freq_ratio: int | None = None,
+        generator: torch.Generator | None = None,
+    ) -> tuple[torch.Tensor, None]:
+        """Image2World via official Cosmos2.5 pipeline. Returns (video [B,T,3,H,W] in [0,1], latents=None)."""
+        tower = self.video_tower
+        if not isinstance(tower, CosmosVideoTower):
+            raise RuntimeError("predict_video requires CosmosVideoTower.")
+        return tower.generate_video(
+            video,
+            prompt_embeds,
+            num_inference_steps=num_inference_steps,
+            num_pixel_frames_out=num_pixel_frames_out,
+            num_frames_in=num_frames_in,
+            seq_len=seq_len,
+            action_video_freq_ratio=action_video_freq_ratio,
+            generator=generator,
         )
 
     @torch.no_grad()
@@ -750,10 +985,6 @@ class Phi0(torch.nn.Module):
             inputs.get("video"), inputs=inputs
         ) if "video" in inputs else (None, None)
         action = inputs["action"]
-        proprio, future, _, _ = self._action_proprio_future(
-            action, inputs.get("action_is_pad"), inputs.get("action_dim_is_pad")
-        )
-        num_frames = int(future.shape[1])
         batch_size = int(action_ctx.shape[0])
         context_emb = inputs.get("context_emb")
         vggt_context_emb = inputs.get("vggt_context_emb")
@@ -764,10 +995,28 @@ class Phi0(torch.nn.Module):
                 context_emb=context_emb,
                 vggt_context_emb=vggt_context_emb,
             )
+        if self.uses_history_action_input():
+            history, future, _, _ = self._action_history_future(
+                action, inputs.get("action_is_pad"), inputs.get("action_dim_is_pad")
+            )
+            return self.predict_action(
+                action_ctx,
+                action_ctx_mask,
+                future.shape[1],
+                batch_size=batch_size,
+                context_emb=context_emb,
+                vggt_context=vggt_ctx,
+                vggt_context_mask=vggt_ctx_mask,
+                vggt_context_emb=vggt_context_emb,
+                history=history,
+            )
+        proprio, future, _, _ = self._action_proprio_future(
+            action, inputs.get("action_is_pad"), inputs.get("action_dim_is_pad")
+        )
         return self.predict_action(
             action_ctx,
             action_ctx_mask,
-            num_frames,
+            future.shape[1],
             batch_size=batch_size,
             context_emb=context_emb,
             vggt_context=vggt_ctx,

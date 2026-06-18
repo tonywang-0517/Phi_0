@@ -10,6 +10,7 @@ import torch
 from omegaconf import DictConfig, OmegaConf
 from torch.utils.data import DataLoader
 
+from phi0.data.cosmos_video_size import cosmos_video_size_from_cfg
 from phi0.data.processor import Phi0MixedDataset, Phi0Processor, build_overfit_datasets
 from phi0.data.sequence import SequenceDataset, sequence_dataset_from_cfg
 from phi0.data.action_stats import (
@@ -212,7 +213,7 @@ def create_phi0(cfg: DictConfig, smoke: bool = False) -> Phi0:
             "lambda_video=0 but freeze_transformer=false: Cosmos DiT still runs each step for hook "
             "context without video-loss gradients. Set freeze_transformer=true for action-only training."
         )
-    return Phi0.from_cosmos_pretrained(
+    model = Phi0.from_cosmos_pretrained(
         device=device,
         torch_dtype=dtype,
         base_model=model_cfg.get("base_model"),
@@ -249,10 +250,27 @@ def create_phi0(cfg: DictConfig, smoke: bool = False) -> Phi0:
         enable_cosmos_gradient_checkpointing=bool(
             model_cfg.get("enable_cosmos_gradient_checkpointing", False)
         ),
+        cosmos_hook_early_exit=bool(model_cfg.get("cosmos_hook_early_exit", True)),
+        infer_generate_video=bool(model_cfg.get("inference", {}).get("generate_video", False)),
+        video_fm_config=OmegaConf.to_container(model_cfg.get("video_fm", {}), resolve=True),
         prompt_max_length=int(model_cfg.get("prompt_max_length", 512)),
-        past_action_window_size=int(model_cfg.get("past_action_window_size", 0)),
+        past_action_window_size=int(model_cfg.get("past_action_window_size", 4)),
+        action_history_window=(
+            int(model_cfg["action_history_window"])
+            if model_cfg.get("action_history_window") is not None
+            else None
+        ),
+        action_future_horizon=(
+            int(model_cfg["action_future_horizon"])
+            if model_cfg.get("action_future_horizon") is not None
+            else None
+        ),
+        vggt_use_full_video=bool(model_cfg.get("vggt_use_full_video", True)),
         vggt_tower=build_vggt_tower(cfg, device=device, torch_dtype=dtype),
     )
+    # Importing diffusers (Cosmos pipeline) can leave grad disabled globally.
+    torch.set_grad_enabled(True)
+    return model
 
 
 def build_dataloader(cfg: DictConfig) -> DataLoader:
@@ -261,11 +279,13 @@ def build_dataloader(cfg: DictConfig) -> DataLoader:
     if video_path is not None and str(video_path).lower() in {"", "null", "none"}:
         video_path = None
     cache_video = bool(data_cfg.get("cache_video", True))
+    image_size = cosmos_video_size_from_cfg(data_cfg)
     mixed = build_overfit_datasets(
         xperience_max_frames=int(data_cfg.get("xperience_max_frames", 32)),
         egodex_max_frames=int(data_cfg.get("egodex_max_frames", 32)),
         xperience_video=video_path,
         cache_video=cache_video,
+        image_size=image_size,
     )
     seq = sequence_dataset_from_cfg(mixed, data_cfg)
     num_workers = int(cfg.get("num_workers", 0))
@@ -288,11 +308,13 @@ def _datasets_for_stats(cfg: DictConfig):
     video_path = data_cfg.get("xperience_video")
     if video_path is not None and str(video_path).lower() in {"", "null", "none"}:
         video_path = None
+    image_size = cosmos_video_size_from_cfg(data_cfg)
     mixed = build_overfit_datasets(
         xperience_max_frames=int(data_cfg.get("xperience_max_frames", 32)),
         egodex_max_frames=int(data_cfg.get("egodex_max_frames", 32)),
         xperience_video=video_path,
         cache_video=False,
+        image_size=image_size,
     )
     return list(mixed.datasets)
 
@@ -323,8 +345,13 @@ def ensure_action_stats(cfg: DictConfig) -> Dict[str, Any]:
 
 def build_processor(cfg: DictConfig) -> Phi0Processor:
     data_cfg = cfg.data
+    crop_scale = data_cfg.get("cosmos_video_crop_scale")
+    if crop_scale is not None:
+        crop_scale = float(crop_scale)
     processor = Phi0Processor(
         normalize=bool(data_cfg.get("normalize", True)),
+        cosmos_video_size=cosmos_video_size_from_cfg(data_cfg),
+        cosmos_video_crop_scale=crop_scale,
     )
     if not processor.normalize:
         return processor.train()
@@ -368,12 +395,17 @@ def prepare_model_batch(
 ) -> Dict[str, Any]:
     sample = processor.preprocess(batch)
     pixel = sample["pixel_values"]
+    pixel_native = sample.get("pixel_values_native", pixel)
     # Mono camera only: [B, T, C, H, W]
     if pixel.ndim == 6:
         pixel = pixel[:, 0]
+    if pixel_native.ndim == 6:
+        pixel_native = pixel_native[:, 0]
     b, t, c, h, w = pixel.shape
     video = pixel.permute(0, 2, 1, 3, 4).contiguous()
     video = video * 2.0 - 1.0
+    vggt_video = pixel_native.permute(0, 2, 1, 3, 4).contiguous()
+    vggt_video = vggt_video * 2.0 - 1.0
 
     if getattr(model.video_tower, "text_encoder", None) is not None:
         if prompt_cache is not None:
@@ -387,6 +419,7 @@ def prepare_model_batch(
 
     out = {
         "video": video,
+        "vggt_video": vggt_video,
         "context": context,
         "context_mask": context_mask,
         "action": sample["action"],
@@ -396,6 +429,37 @@ def prepare_model_batch(
     }
     if batch.get("input_latents") is not None:
         out["input_latents"] = batch["input_latents"].to(device=model.device, dtype=model.torch_dtype)
+
+    device = model.device
+    dtype = model.torch_dtype
+    video = video.to(device=device, dtype=dtype, non_blocking=True)
+    vggt_video = vggt_video.to(device=device, dtype=dtype, non_blocking=True)
+    context = context.to(device=device, dtype=dtype, non_blocking=True)
+    context_mask = context_mask.to(device=device, non_blocking=True)
+    out["video"] = video
+    out["vggt_video"] = vggt_video
+    out["context"] = context
+    out["context_mask"] = context_mask
+
+    # Frozen towers: precompute context once under inference_mode (no autograd graph).
+    with torch.inference_mode():
+        if float(getattr(model, "loss_lambda_video", 0.0)) <= 0 and float(
+            getattr(model, "loss_lambda_action", 0.0)
+        ) > 0:
+            hook_video = video[:, :, -1:, :, :]
+            _, action_ctx, action_ctx_mask = model.video_tower.forward_joint_step(
+                hook_video,
+                context,
+                compute_video_loss=False,
+            )
+            out["action_ctx"] = action_ctx.detach().clone()
+            out["action_ctx_mask"] = action_ctx_mask.detach().clone()
+
+        if model.uses_dual_vggt_cross_attn() and model.vggt_tower is not None:
+            vggt_ctx, vggt_ctx_mask = model.vggt_tower.extract_register_context(vggt_video)
+            out["vggt_ctx"] = vggt_ctx.detach()
+            out["vggt_ctx_mask"] = vggt_ctx_mask
+
     return out
 
 
@@ -476,8 +540,10 @@ def run_training(cfg: DictConfig) -> None:
     step = start_step
     logger.info("Training steps %d -> %d", start_step, max_steps)
     model.train()
+    model.set_frozen_towers_eval()
     while step < max_steps:
         for batch in loader:
+            model.set_frozen_towers_eval()
             model_batch = prepare_model_batch(model, processor, batch, prompt_cache=prompt_cache)
             model_batch = {
                 k: (v.to(device, non_blocking=True) if torch.is_tensor(v) else v)

@@ -38,6 +38,7 @@ class CosmosComponents:
     transformer: torch.nn.Module | None
     text_encoder: torch.nn.Module | None
     tokenizer: object | None
+    scheduler: object | None
     latents_mean: torch.Tensor | None
     latents_std: torch.Tensor | None
     vae_scale_factor_spatial: int
@@ -141,6 +142,7 @@ def load_cosmos_predict25_2b(
             + "\nRe-download following DiT4DiT README (see DiT4DiT/README.md)."
         )
 
+    grad_was_enabled = torch.is_grad_enabled()
     pipe = Cosmos2_5_PredictBasePipeline.from_pretrained(
         str(base_path),
         revision=revision,
@@ -148,6 +150,9 @@ def load_cosmos_predict25_2b(
         local_files_only=local_files_only,
         safety_checker=_DefaultDummySafetyChecker(),
     )
+    # Diffusers pipeline load can leave grad disabled globally; restore for training.
+    if grad_was_enabled:
+        torch.set_grad_enabled(True)
 
     vae = pipe.vae.to(device=device, dtype=torch_dtype)
     transformer = (
@@ -196,13 +201,17 @@ def load_cosmos_predict25_2b(
         text_embed_dim = 1024
     in_channels = int(transformer.config.in_channels) if transformer is not None else 17
 
+    scheduler = pipe.scheduler
+
     del pipe
 
+    torch.set_grad_enabled(True)
     return CosmosComponents(
         vae=vae,
         transformer=transformer,
         text_encoder=text_encoder,
         tokenizer=tokenizer,
+        scheduler=scheduler,
         latents_mean=latents_mean,
         latents_std=latents_std,
         vae_scale_factor_spatial=vae_scale_factor_spatial,

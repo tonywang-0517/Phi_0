@@ -7,6 +7,7 @@ from typing import Any, Dict, Optional
 import torch
 import torch.nn as nn
 
+from fastwam.models.wan22.helpers.gradient import gradient_checkpoint_forward
 from fastwam.models.wan22.wan_video_dit import (
     DiTBlock,
     modulate,
@@ -14,7 +15,7 @@ from fastwam.models.wan22.wan_video_dit import (
     sinusoidal_embedding_1d,
 )
 from phi0.models.action_cross_attn import cross_attn_target, resolve_action_cross_attn_mode
-from phi0.models.action_proprio import merge_proprio_action_embeddings
+from phi0.models.dit4dit_action_encoder import Dit4DiTActionEncoder
 from phi0.models.vggt.tower import VGGT_REGISTER_DIM
 
 
@@ -59,7 +60,7 @@ class ActionFMDiT(nn.Module):
         self.add_pos_embed = bool(add_pos_embed)
         self.proprio_window = int(proprio_window)
 
-        self.action_encoder = nn.Linear(raw_action_dim, hidden_dim)
+        self.flow_action_encoder = Dit4DiTActionEncoder(raw_action_dim, hidden_dim)
         self.proprio_encoder = (
             nn.Linear(raw_action_dim, hidden_dim) if self.proprio_window > 0 else None
         )
@@ -135,6 +136,38 @@ class ActionFMDiT(nn.Module):
             raise RuntimeError("vggt_embedding is only defined for dual_cosmos_vggt mode.")
         return self.vggt_embedding(vggt_context)
 
+    def _encode_fm_action_tokens(
+        self,
+        action_tokens: torch.Tensor,
+        timestep: torch.Tensor,
+        proprio_tokens: Optional[torch.Tensor],
+    ) -> tuple[torch.Tensor, Dict[str, Any]]:
+        """DiT4DiT-style: flow-t on noisy actions; proprio prefix without pos embed."""
+        batch_size, action_seq_len, _ = action_tokens.shape
+        t_disc = timestep.long()
+        action_emb = self.flow_action_encoder(action_tokens, t_disc)
+        if self.add_pos_embed and self.position_embedding is not None:
+            pos_ids = torch.arange(action_seq_len, device=action_emb.device, dtype=torch.long)
+            action_emb = action_emb + self.position_embedding(pos_ids).unsqueeze(0)
+
+        proprio_len = 0
+        if proprio_tokens is not None and proprio_tokens.shape[1] > 0:
+            if self.proprio_encoder is None:
+                raise ValueError("proprio_tokens provided but proprio_window is 0")
+            proprio_emb = self.proprio_encoder(proprio_tokens)
+            tokens = torch.cat([proprio_emb, action_emb], dim=1)
+            proprio_len = int(proprio_tokens.shape[1])
+        else:
+            tokens = action_emb
+
+        meta = {
+            "batch_size": batch_size,
+            "action_seq_len": action_seq_len,
+            "proprio_len": proprio_len,
+            "total_seq_len": tokens.shape[1],
+        }
+        return tokens, meta
+
     def pre_dit(
         self,
         action_tokens: torch.Tensor,
@@ -174,13 +207,7 @@ class ActionFMDiT(nn.Module):
         elif proprio_tokens is None and self.proprio_window > 0:
             raise ValueError("proprio_tokens required when proprio_window > 0")
 
-        tokens, meta = merge_proprio_action_embeddings(
-            self.proprio_encoder if self.proprio_encoder is not None else self.action_encoder,
-            self.action_encoder,
-            proprio_tokens,
-            action_tokens,
-            position_embedding=self.position_embedding,
-        )
+        tokens, meta = self._encode_fm_action_tokens(action_tokens, timestep, proprio_tokens)
         total_len = meta["total_seq_len"]
         context_attn_mask = context_mask.unsqueeze(1).expand(-1, total_len, -1)
 

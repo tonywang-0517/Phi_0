@@ -19,12 +19,14 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
 from phi0.checkpoint_utils import merge_saved_cfg
+from phi0.data.cosmos_video_size import cosmos_video_size_from_cfg, round_hw_to_multiple
 from phi0.data.processor import Phi0Processor
 from phi0.data.temporal_align import DEFAULT_DATASET_NATIVE_FPS
 from phi0.inference.session import ActionInferenceSession, PromptEmbedCache
 from phi0.runtime import (
     activate_cuda_device,
     apply_processor_stats_from_checkpoint,
+    build_processor,
     create_phi0,
     resolve_inference_device,
     sync_model_action_norm,
@@ -83,7 +85,7 @@ def parse_args():
         help="MP4 path; uses --frame-index as starting frame",
     )
     p.add_argument("--frame-index", type=int, default=0)
-    p.add_argument("--image-size", type=int, nargs=2, default=[480, 640], metavar=("H", "W"))
+    p.add_argument("--image-size", type=int, nargs=2, default=None, metavar=("H", "W"))
     p.add_argument("--prompt", type=str, default=None, help="Task instruction for text encoder")
     p.add_argument(
         "--tiled",
@@ -176,7 +178,7 @@ def main():
         model.load_checkpoint(args.checkpoint)
     model.eval()
 
-    processor = Phi0Processor(normalize=True).eval()
+    processor = build_processor(cfg).eval()
     if isinstance(payload, dict):
         apply_processor_stats_from_checkpoint(processor, payload, cfg)
     sync_model_action_norm(model, processor)
@@ -191,8 +193,11 @@ def main():
         native_fps = float(native_map.get("xperience", 20.0) if hasattr(native_map, "get") else 20.0)
 
     input_path, frame_index = _resolve_input_path(args)
-    h, w = args.image_size
-    h, w = _round_to_multiple(h), _round_to_multiple(w)
+    if args.image_size is not None:
+        h, w = int(args.image_size[0]), int(args.image_size[1])
+    else:
+        h, w = cosmos_video_size_from_cfg(cfg.data)
+    h, w = round_hw_to_multiple(h, w)
     rgb = _load_rgb_frame(input_path, frame_index, (h, w))
     input_image = _build_input_tensor(model, rgb)
     prompt = args.prompt or "human egocentric manipulation task"

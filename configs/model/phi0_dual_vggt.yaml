@@ -5,6 +5,8 @@ defaults:
   - phi0_full
   - _self_
 
+vggt_use_full_video: true
+
 action_dit_config:
   action_cross_attn_mode: dual_cosmos_vggt
 

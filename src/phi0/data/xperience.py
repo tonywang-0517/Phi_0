@@ -12,6 +12,7 @@ import torch
 from torch.utils.data import Dataset
 
 from phi0.data.video_cache import preload_mp4_frames
+from phi0.data.cosmos_video_size import DEFAULT_COSMOS_VIDEO_SIZE
 from phi0.schema.draw_schema import D_RAW, DrawLayout, pack_xperience_keypoints
 
 DEFAULT_HDF5 = Path(
@@ -54,7 +55,7 @@ class XperienceDataset(Dataset):
         frame_stride: int = 1,
         start_frame: int = 0,
         video_path: Optional[str | Path] = None,
-        image_size: Tuple[int, int] = (480, 640),
+        image_size: Tuple[int, int] = DEFAULT_COSMOS_VIDEO_SIZE,
         cache_video: bool = True,
     ):
         self.hdf5_path = Path(hdf5_path)

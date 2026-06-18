@@ -1,0 +1,13 @@
+# @package _global_
+# Shared 400-step ablation training base (ACT + dual VGGT).
+
+defaults:
+  - train_act_dual_vggt
+  - _self_
+
+max_steps: 400
+save_every_steps: 100
+checkpoint_overwrite: true
+save_optimizer: true
+resume_ckpt: null
+repeated_action_steps: 1  # 704p: avoid 4x action batch repeat (Cosmos/VGGT frozen)

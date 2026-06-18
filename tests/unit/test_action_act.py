@@ -23,14 +23,14 @@ def test_action_act_dit_forward_shape():
     )
     b, t, d = 2, 7, 16
     ctx = torch.randn(b, 8, 32)
-    placeholder = torch.zeros(b, t, d)
-    out = expert(placeholder, ctx)
+    history = torch.randn(b, t, d)
+    out = expert(history, ctx)
     assert out.shape == (b, t, d)
 
 
 def test_training_loss_act():
     model = create_phi0_action_only_smoke(
-        device="cpu", torch_dtype=torch.float32, action_head="act"
+        device="cpu", torch_dtype=torch.float32, action_head="act", past_action_window_size=2
     )
     model.loss_lambda_bone = 0.0
     model.loss_lambda_bone_hand = 0.0
@@ -38,9 +38,9 @@ def test_training_loss_act():
     model.train()
     assert model.action_head == "act"
     assert model.action_fm is None
-    b, t, d = 1, 5, model.action_expert.raw_action_dim
+    b, t, d = 1, 4, model.action_expert.raw_action_dim
     sample = {
-        "video": torch.rand(b, 3, t, 480, 640) * 2.0 - 1.0,
+        "video": torch.rand(b, 3, 3, 480, 640) * 2.0 - 1.0,
         "context": torch.randn(1, 4, model.text_dim),
         "context_mask": torch.ones(1, 4, dtype=torch.bool),
         "action": torch.randn(b, t, d),
@@ -54,12 +54,13 @@ def test_training_loss_act():
 
 def test_act_predict_routes_through_session():
     model = create_phi0_action_only_smoke(
-        device="cpu", torch_dtype=torch.float32, action_head="act"
+        device="cpu", torch_dtype=torch.float32, action_head="act", past_action_window_size=4
     )
     model.eval()
     session = ActionInferenceSession(model)
     img0 = torch.rand(1, 3, 480, 640) * 2.0 - 1.0
     session.prefill_from_image(img0, "pick up cup")
+    session.seed_proprio_from_normalized(torch.randn(model.action_expert.raw_action_dim))
     pred = session.predict(7)
     assert pred.shape == (7, model.action_expert.raw_action_dim)
 

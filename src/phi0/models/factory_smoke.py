@@ -17,7 +17,7 @@ def create_phi0_action_only_smoke(
     hidden_dim: int = 1024,
     text_dim: int = 512,
     action_head: str = "fm",
-    past_action_window_size: int = 0,
+    past_action_window_size: int = 2,
 ) -> Phi0:
     """Minimal Phi0 for CPU smoke tests without HuggingFace downloads."""
     action_dit_config = {

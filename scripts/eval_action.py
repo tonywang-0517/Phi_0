@@ -24,6 +24,7 @@ sys.path.insert(0, str(ROOT / "src"))
 
 from phi0.checkpoint_utils import merge_saved_cfg
 from phi0.data.egodex import EgoDexDataset
+from phi0.data.cosmos_video_size import cosmos_video_size_from_cfg, round_hw_to_multiple
 from phi0.data.processor import Phi0Processor, build_overfit_datasets
 from phi0.data.sequence import SequenceDataset, sequence_dataset_from_cfg
 from phi0.data.temporal_align import (
@@ -46,6 +47,7 @@ from phi0.inference.session import (
 from phi0.runtime import (
     activate_cuda_device,
     apply_processor_stats_from_checkpoint,
+    build_processor,
     create_phi0,
     list_cuda_memory,
     prepare_model_batch,
@@ -240,9 +242,11 @@ def fm_chunk_eval(
 ) -> Dict[str, Any]:
     data_cfg = cfg.data
     if seq is None:
+        image_size = round_hw_to_multiple(*cosmos_video_size_from_cfg(data_cfg))
         mixed = build_overfit_datasets(
             xperience_max_frames=int(data_cfg.get("xperience_max_frames", 16)),
             egodex_max_frames=int(data_cfg.get("egodex_max_frames", 16)),
+            image_size=image_size,
         )
         seq = sequence_dataset_from_cfg(mixed, data_cfg)
     processor = processor.eval()
@@ -354,9 +358,11 @@ def random_baseline_eval(
     """Zero-action baseline with same FM chunk-eval setup."""
     data_cfg = cfg.data
     if seq is None:
+        image_size = round_hw_to_multiple(*cosmos_video_size_from_cfg(data_cfg))
         mixed = build_overfit_datasets(
             xperience_max_frames=int(data_cfg.get("xperience_max_frames", 16)),
             egodex_max_frames=int(data_cfg.get("egodex_max_frames", 16)),
+            image_size=image_size,
         )
         seq = sequence_dataset_from_cfg(mixed, data_cfg)
     processor = processor.eval()
@@ -475,15 +481,20 @@ def deploy_fm_eval(
     native_fps: float = 20.0,
     action_video_freq_ratio: int = 2,
     action_chunk_size: int | None = None,
-    seq_len: int = 33,
+    seq_len: int = 58,
+    cosmos_video_size: tuple[int, int] = (704, 1280),
 ) -> Dict[str, Any]:
-    xp = XperienceDataset(max_frames=start_frame + native_span_frames(num_frames, deploy_fps, native_fps), start_frame=0, cache_video=True)
+    h, w = round_hw_to_multiple(*cosmos_video_size)
+    xp = XperienceDataset(
+        max_frames=start_frame + native_span_frames(num_frames, deploy_fps, native_fps),
+        start_frame=0,
+        cache_video=True,
+        image_size=(h, w),
+    )
     video_path = xp.video_path
     if video_path is None or not video_path.exists():
         raise FileNotFoundError("Xperience stereo_left.mp4 not found for deploy eval")
 
-    h, w = xp.image_size
-    h, w = _round_to_multiple(h), _round_to_multiple(w)
     prompt = xp.task_text
     prompt_cache = PromptEmbedCache()
     refresh_every = max(1, int(video_refresh_interval))
@@ -515,9 +526,9 @@ def deploy_fm_eval(
         processor=processor,
         deploy_seq_len=seq_len,
         action_video_freq_ratio=action_video_freq_ratio,
-        use_gt_proprio=True,
+        use_gt_history=True,
     )
-    proprio_w = int(getattr(model, "past_action_window_size", 0))
+    history_w = int(getattr(model, "past_action_window_size", 4))
 
     def _read_chw(control_t: int) -> torch.Tensor:
         native_t = start_frame + int(round(control_t * native_fps / deploy_fps))
@@ -532,7 +543,7 @@ def deploy_fm_eval(
             _read_chw,
             seq_len=seq_len,
             action_video_freq_ratio=action_video_freq_ratio,
-            past_window=proprio_w,
+            past_window=history_w,
             device=model.device,
             dtype=model.torch_dtype,
         )
@@ -545,10 +556,10 @@ def deploy_fm_eval(
             )
         else:
             session.refresh_video_context_from_clip(_deploy_video_clip(seg_start))
-        if proprio_w > 0:
-            proprio_ctrl = deploy_proprio_control_indices(seg_start, proprio_w)
-            session.set_proprio_gt(
-                torch.stack([gt_norm_by_control[c].reshape(-1) for c in proprio_ctrl], dim=0)
+        if history_w > 0:
+            history_ctrl = deploy_proprio_control_indices(seg_start, history_w)
+            session.set_history_gt(
+                torch.stack([gt_norm_by_control[c].reshape(-1) for c in history_ctrl], dim=0)
             )
         chunk_len = min(action_chunk, num_frames - seg_start)
         chunk = session.predict(chunk_len)
@@ -611,7 +622,8 @@ def deploy_fm_eval(
         "deploy_video_clip_frames": len(video_ctrl_idx),
         "use_gt_proprio": True,
         "deploy_align": "training_clip_gt_proprio",
-        "proprio_window": proprio_w,
+        "history_window": history_w,
+        "proprio_window": history_w,
         "fm_segment_len": action_chunk,
         "start_frame": start_frame,
         "video": str(video_path),
@@ -656,12 +668,13 @@ def main():
     if isinstance(payload, dict) and ("model" in payload or "action_expert" in payload):
         model.load_checkpoint(args.checkpoint)
 
-    processor = Phi0Processor(normalize=True).eval()
+    processor = build_processor(cfg).eval()
     if isinstance(payload, dict):
         apply_processor_stats_from_checkpoint(processor, payload, cfg)
     sync_model_action_norm(model, processor)
     model.eval()
 
+    cosmos_hw = round_hw_to_multiple(*cosmos_video_size_from_cfg(cfg.data))
     max_clips = args.max_clips if args.max_clips > 0 else None
     deploy_fps = float(args.deploy_fps if args.deploy_fps is not None else cfg.data.get("control_fps", 20.0))
     deploy_seconds = float(args.deploy_seconds)
@@ -679,6 +692,7 @@ def main():
     mixed = build_overfit_datasets(
         xperience_max_frames=int(cfg.data.get("xperience_max_frames", 16)),
         egodex_max_frames=int(cfg.data.get("egodex_max_frames", 16)),
+        image_size=cosmos_hw,
     )
     seq = sequence_dataset_from_cfg(mixed, cfg.data)
     prompt_cache = PromptEmbedCache()
@@ -715,7 +729,8 @@ def main():
         video_refresh_interval=refresh_iv,
         native_fps=native_fps,
         action_video_freq_ratio=video_ratio,
-        seq_len=int(cfg.data.get("seq_len", 33)),
+        seq_len=int(cfg.data.get("seq_len", 58)),
+        cosmos_video_size=cosmos_hw,
     )
 
     report: Dict[str, Any] = {

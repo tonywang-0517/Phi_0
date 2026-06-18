@@ -3,12 +3,14 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 import torch
 from torch.utils.data import ConcatDataset, Dataset
 
+from phi0.data.dit4dit_video import dit4dit_preprocess_video
 from phi0.data.egodex import EgoDexDataset
+from phi0.data.cosmos_video_size import DEFAULT_COSMOS_VIDEO_SIZE, cosmos_video_size_from_cfg
 from phi0.data.xperience import XperienceDataset
 from phi0.schema.draw_schema import D_RAW
 from phi0.data.action_stats import load_action_stats, stats_to_tensors
@@ -59,6 +61,7 @@ def build_overfit_datasets(
     egodex_max_frames: int = 32,
     xperience_video: str | Path | None = None,
     cache_video: bool = True,
+    image_size: Tuple[int, int] = DEFAULT_COSMOS_VIDEO_SIZE,
 ) -> Phi0MixedDataset:
     return Phi0MixedDataset(
         [
@@ -66,8 +69,13 @@ def build_overfit_datasets(
                 max_frames=xperience_max_frames,
                 video_path=xperience_video,
                 cache_video=cache_video,
+                image_size=image_size,
             ),
-            EgoDexDataset(max_frames=egodex_max_frames, cache_video=cache_video),
+            EgoDexDataset(
+                max_frames=egodex_max_frames,
+                cache_video=cache_video,
+                image_size=image_size,
+            ),
         ]
     )
 
@@ -79,9 +87,14 @@ class Phi0Processor:
         self,
         action_dim: int = D_RAW,
         normalize: bool = True,
+        *,
+        cosmos_video_size: Tuple[int, int] = DEFAULT_COSMOS_VIDEO_SIZE,
+        cosmos_video_crop_scale: Optional[float] = None,
     ):
         self.action_dim = action_dim
         self.normalize = normalize
+        self.cosmos_video_size = (int(cosmos_video_size[0]), int(cosmos_video_size[1]))
+        self.cosmos_video_crop_scale = cosmos_video_crop_scale
         self._is_train = True
         self.register_stats()
 
@@ -141,9 +154,16 @@ class Phi0Processor:
         else:
             raise ValueError(f"Expected ego_view [B,T,C,H,W] or [B,Cam,T,C,H,W], got {pixel.ndim}D")
 
+        cosmos_pixel = dit4dit_preprocess_video(
+            pixel.float(),
+            size=self.cosmos_video_size,
+            crop_scale=self.cosmos_video_crop_scale,
+        )
+
         return {
             "instruction": batch["task"],
-            "pixel_values": pixel,
+            "pixel_values": cosmos_pixel,
+            "pixel_values_native": pixel,
             "image_is_pad": batch["image_is_pad"],
             "action": action_norm,
             "action_is_pad": batch["action_is_pad"],

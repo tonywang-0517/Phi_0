@@ -36,7 +36,7 @@ data:
     xperience: 20.0
     egodex: 30.0
   clip_stride: 1
-  # seq_len = control steps at control_fps; 33 steps @ 20Hz ≈ 1.65s wall time for all datasets.
+  # seq_len = proprio prefix + future horizon control steps @ control_fps (33 @ 20Hz).
   seq_len: 33
   xperience_max_frames: 256
   egodex_max_frames: 256
@@ -47,6 +47,9 @@ data:
   auto_compute_action_stats: true
   mono_camera: true
   cache_video: true  # preload MP4 once; removes per-frame cv2 open/seek
+  # Cosmos Video2World @ robot 720-tier (704x1280 landscape; official post-train resolution).
+  cosmos_video_size: [704, 1280]
+  cosmos_video_crop_scale: null
 
 hydra:
   job:

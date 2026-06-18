@@ -1,4 +1,4 @@
-"""Training-aligned deploy: 33-step control clip + 17-frame video subsample + GT proprio."""
+"""Training-aligned deploy: 58-step control clip + subsampled video + GT history."""
 
 from __future__ import annotations
 
@@ -7,6 +7,7 @@ from typing import Callable, List, Sequence
 import torch
 
 from phi0.data.temporal_align import video_sample_control_indices
+from phi0.models.action_history import DEFAULT_ACTION_HISTORY_WINDOW
 
 
 def control_step_to_native_frame(
@@ -18,37 +19,48 @@ def control_step_to_native_frame(
     return int(start_frame) + int(round(int(control_t) * float(native_fps) / float(deploy_fps)))
 
 
-def deploy_clip_start(seg_start: int, past_window: int = 4) -> int:
-    """Control index where a training-style clip begins (proprio prefix = first ``past_window`` steps)."""
-    return max(0, int(seg_start) - int(past_window))
+def deploy_clip_start(seg_start: int, history_window: int = DEFAULT_ACTION_HISTORY_WINDOW) -> int:
+    """Control index where a training-style clip begins (history ends at ``seg_start``)."""
+    return max(0, int(seg_start) - (int(history_window) - 1))
 
 
 def deploy_control_clip_indices(
     seg_start: int,
-    seq_len: int = 33,
+    seq_len: int = 58,
     *,
-    past_window: int = 4,
+    history_window: int = DEFAULT_ACTION_HISTORY_WINDOW,
 ) -> List[int]:
     """``seq_len`` control steps forward from clip start (matches ``SequenceDataset``)."""
-    clip_start = deploy_clip_start(seg_start, past_window)
+    clip_start = deploy_clip_start(seg_start, history_window)
     return [clip_start + i for i in range(int(seq_len))]
 
 
-def deploy_proprio_control_indices(seg_start: int, past_window: int = 4) -> List[int]:
-    """Proprio = first ``past_window`` steps of the clip (training ``split_proprio_future``)."""
-    clip_start = deploy_clip_start(seg_start, past_window)
-    return [clip_start + i for i in range(int(past_window))]
+def deploy_history_control_indices(
+    seg_start: int,
+    history_window: int = DEFAULT_ACTION_HISTORY_WINDOW,
+) -> List[int]:
+    """History = first ``history_window`` steps of the clip (training ``split_history_future``)."""
+    clip_start = deploy_clip_start(seg_start, history_window)
+    return [clip_start + i for i in range(int(history_window))]
+
+
+def deploy_proprio_control_indices(
+    seg_start: int,
+    past_window: int = DEFAULT_ACTION_HISTORY_WINDOW,
+) -> List[int]:
+    """Deprecated alias for ``deploy_history_control_indices``."""
+    return deploy_history_control_indices(seg_start, history_window=past_window)
 
 
 def deploy_subsampled_video_control_indices(
     seg_start: int,
     *,
-    seq_len: int = 33,
+    seq_len: int = 58,
     action_video_freq_ratio: int = 2,
-    past_window: int = 4,
+    history_window: int = DEFAULT_ACTION_HISTORY_WINDOW,
 ) -> List[int]:
-    """17 absolute control indices (training ``video_control_indices`` on deploy timeline)."""
-    clip = deploy_control_clip_indices(seg_start, seq_len, past_window=past_window)
+    """Subsampled video control indices (training ``video_control_indices`` on deploy timeline)."""
+    clip = deploy_control_clip_indices(seg_start, seq_len, history_window=history_window)
     rel = video_sample_control_indices(seq_len, action_video_freq_ratio)
     return [clip[i] for i in rel]
 
@@ -86,20 +98,22 @@ def build_deploy_video_tensor(
     seg_start: int,
     read_chw: Callable[[int], torch.Tensor],
     *,
-    seq_len: int = 33,
+    seq_len: int = 58,
     action_video_freq_ratio: int = 2,
-    past_window: int = 4,
+    history_window: int = DEFAULT_ACTION_HISTORY_WINDOW,
+    past_window: int | None = None,
     device: torch.device,
     dtype: torch.dtype,
 ) -> torch.Tensor:
-    """Build training-aligned subsampled clip starting at ``seg_start - past_window``."""
+    """Build training-aligned subsampled clip ending history at ``seg_start``."""
+    if past_window is not None:
+        history_window = int(past_window)
     ctrl_indices = deploy_subsampled_video_control_indices(
         seg_start,
         seq_len=seq_len,
         action_video_freq_ratio=action_video_freq_ratio,
-        past_window=past_window,
+        history_window=history_window,
     )
-    # Deduplicate reads when early clip repeats control index 0.
     unique_ctrl: list[int] = []
     index_map: dict[int, int] = {}
     order: list[int] = []

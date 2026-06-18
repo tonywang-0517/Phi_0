@@ -13,7 +13,9 @@ from fastwam.models.wan22.wan_video_dit import (
     precompute_freqs_cis,
 )
 from phi0.models.action_cross_attn import cross_attn_target, resolve_action_cross_attn_mode
+from phi0.models.action_history import history_to_flow_source
 from phi0.models.action_proprio import merge_proprio_action_embeddings
+from phi0.models.dit4dit_action_encoder import Dit4DiTActionEncoder
 from phi0.models.vggt.tower import VGGT_REGISTER_DIM
 
 
@@ -37,6 +39,8 @@ class ActionACTDiT(nn.Module):
         vggt_dim: int = VGGT_REGISTER_DIM,
         add_pos_embed: bool = True,
         proprio_window: int = 0,
+        action_token_encoder: str = "linear",
+        action_future_horizon: int | None = None,
     ):
         super().__init__()
         self.hidden_dim = hidden_dim
@@ -52,11 +56,29 @@ class ActionACTDiT(nn.Module):
         self.interleave_self_attention = self.action_cross_attn_mode == "interleave_cosmos"
         self.add_pos_embed = bool(add_pos_embed)
         self.proprio_window = int(proprio_window)
+        self.action_token_encoder = str(action_token_encoder).strip().lower()
+        self.action_future_horizon = (
+            int(action_future_horizon) if action_future_horizon is not None else None
+        )
 
         self.action_encoder = nn.Linear(raw_action_dim, hidden_dim)
         self.proprio_encoder = (
             nn.Linear(raw_action_dim, hidden_dim) if self.proprio_window > 0 else None
         )
+        if self.action_token_encoder == "dit4dit_prefix_query":
+            if self.action_future_horizon is None or self.action_future_horizon <= 0:
+                raise ValueError(
+                    "dit4dit_prefix_query requires positive action_future_horizon."
+                )
+            self.prefix_encoder = nn.Sequential(
+                nn.Linear(raw_action_dim, hidden_dim),
+                nn.ReLU(),
+                nn.Linear(hidden_dim, hidden_dim),
+            )
+            self.query_encoder = Dit4DiTActionEncoder(raw_action_dim, hidden_dim)
+        else:
+            self.prefix_encoder = None
+            self.query_encoder = None
         self.output_proj = nn.Linear(hidden_dim, raw_action_dim)
         self.text_embedding = nn.Sequential(
             nn.Linear(text_dim, hidden_dim),
@@ -114,6 +136,7 @@ class ActionACTDiT(nn.Module):
         cfg.setdefault("interleave_self_attention", True)
         cfg.setdefault("add_pos_embed", True)
         cfg.setdefault("proprio_window", 0)
+        cfg.setdefault("action_token_encoder", "linear")
         return cls(raw_action_dim=raw_action_dim, **cfg).to(device=device, dtype=torch_dtype)
 
     def _cross_attn_target(self, block_idx: int) -> Optional[str]:
@@ -123,6 +146,33 @@ class ActionACTDiT(nn.Module):
         if self.vggt_embedding is None:
             raise RuntimeError("vggt_embedding is only defined for dual_cosmos_vggt mode.")
         return self.vggt_embedding(vggt_context)
+
+    def _encode_prefix_query_tokens(self, action_tokens: torch.Tensor) -> tuple[torch.Tensor, Dict[str, Any]]:
+        if self.action_token_encoder != "dit4dit_prefix_query":
+            raise RuntimeError("_encode_prefix_query_tokens requires dit4dit_prefix_query mode.")
+        if self.prefix_encoder is None or self.query_encoder is None:
+            raise RuntimeError("prefix_encoder/query_encoder are not initialized.")
+
+        batch_size, prefix_len, _ = action_tokens.shape
+        future_horizon = int(self.action_future_horizon)
+        prefix_emb = self.prefix_encoder(action_tokens)
+        query_actions = history_to_flow_source(action_tokens, future_horizon)
+        query_timesteps = torch.zeros(batch_size, device=action_tokens.device, dtype=torch.long)
+        query_emb = self.query_encoder(query_actions, query_timesteps)
+        tokens = torch.cat([prefix_emb, query_emb], dim=1)
+        total_len = prefix_len + future_horizon
+
+        if self.add_pos_embed and self.position_embedding is not None:
+            pos_ids = torch.arange(total_len, device=tokens.device, dtype=torch.long)
+            tokens = tokens + self.position_embedding(pos_ids).unsqueeze(0)
+
+        meta = {
+            "batch_size": batch_size,
+            "action_seq_len": future_horizon,
+            "prefix_seq_len": prefix_len,
+            "total_seq_len": total_len,
+        }
+        return tokens, meta
 
     def pre_dit(
         self,
@@ -143,23 +193,26 @@ class ActionACTDiT(nn.Module):
                 f"Expected raw_action_dim={self.raw_action_dim}, got {action_tokens.shape[2]}"
             )
 
-        batch_size, seq_len, _ = action_tokens.shape
+        batch_size, _, _ = action_tokens.shape
         if context_mask is None:
             context_mask = torch.ones(
                 (batch_size, context.shape[1]), dtype=torch.bool, device=context.device
             )
-        if self.proprio_encoder is None:
-            proprio_tokens = None
-        elif proprio_tokens is None and self.proprio_window > 0:
-            raise ValueError("proprio_tokens required when proprio_window > 0")
 
-        tokens, meta = merge_proprio_action_embeddings(
-            self.proprio_encoder if self.proprio_encoder is not None else self.action_encoder,
-            self.action_encoder,
-            proprio_tokens,
-            action_tokens,
-            position_embedding=self.position_embedding,
-        )
+        if self.action_token_encoder == "dit4dit_prefix_query":
+            tokens, meta = self._encode_prefix_query_tokens(action_tokens)
+        else:
+            if self.proprio_encoder is None:
+                proprio_tokens = None
+            elif proprio_tokens is None and self.proprio_window > 0:
+                raise ValueError("proprio_tokens required when proprio_window > 0")
+            tokens, meta = merge_proprio_action_embeddings(
+                self.proprio_encoder if self.proprio_encoder is not None else self.action_encoder,
+                self.action_encoder,
+                proprio_tokens,
+                action_tokens,
+                position_embedding=self.position_embedding,
+            )
         total_len = meta["total_seq_len"]
         context_attn_mask = context_mask.unsqueeze(1).expand(-1, total_len, -1)
 

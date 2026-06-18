@@ -1,0 +1,19 @@
+# @package _global_
+# Ablation 2: prefix=5 (4 history + current), future=29 with DiT4DiT query encoder.
+
+defaults:
+  - train_ablation_base
+  - _self_
+
+output_dir: ./experiments/ablation2_dit4dit_query_400step
+checkpoint_name: ablation2_dit4dit_query_400step
+
+data:
+  seq_len: 34  # 5 history + 29 future
+
+model:
+  action_history_window: 5
+  action_future_horizon: 29
+  action_dit_config:
+    action_token_encoder: dit4dit_prefix_query
+    action_future_horizon: 29

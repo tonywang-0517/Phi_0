@@ -10,6 +10,7 @@ import numpy as np
 import torch
 from torch.utils.data import Dataset
 
+from phi0.data.cosmos_video_size import DEFAULT_COSMOS_VIDEO_SIZE
 from phi0.data.egodex_keypoints import pack_egodex_keypoints_d_raw
 from phi0.data.egodex_smplh import default_processed_path, resolve_processed_hdf5
 from phi0.data.video_cache import preload_mp4_frames
@@ -44,7 +45,7 @@ class EgoDexDataset(Dataset):
         processed_hdf5: str | Path | None = None,
         max_frames: Optional[int] = None,
         frame_stride: int = 1,
-        image_size: Tuple[int, int] = (480, 640),
+        image_size: Tuple[int, int] = DEFAULT_COSMOS_VIDEO_SIZE,
         require_processed: bool = True,
         cache_video: bool = True,
     ):

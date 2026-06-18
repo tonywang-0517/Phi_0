@@ -31,7 +31,7 @@ from phi0.viz.xperience_viz_frame import hdf5_keypoints_for_viz
 
 PRED_COLOR = "royalblue"
 PRED_ROOT_COLOR = "darkorange"
-VIDEO_PANEL_SIZE = (480, 640)  # H, W — matches deploy resize
+VIDEO_PANEL_SIZE = (704, 1280)  # H, W — matches data.cosmos_video_size
 
 
 def resolve_viz_action_chunk_size(

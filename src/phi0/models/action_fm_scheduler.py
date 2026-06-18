@@ -1,4 +1,4 @@
-"""DiT4DiT-style rectified flow matching for action chunks."""
+"""Conditional rectified flow: history prior -> future GT (no Gaussian source)."""
 
 from __future__ import annotations
 
@@ -18,7 +18,7 @@ class ActionFMConfig:
 
 
 class ActionFlowMatching:
-    """Rectified flow: x_t = (1-t)*x0 + t*noise, target velocity v = noise - x0."""
+    """Rectified flow: x_t = (1-t)*x0 + t*source, target velocity v = source - x0."""
 
     def __init__(self, cfg: ActionFMConfig | None = None):
         self.cfg = cfg or ActionFMConfig()
@@ -35,14 +35,14 @@ class ActionFlowMatching:
         return sample / float(self.cfg.noise_s)
 
     @staticmethod
-    def corrupt(clean: torch.Tensor, noise: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
+    def corrupt(clean: torch.Tensor, source: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
         if t.ndim == 1:
             t = t.view(-1, *([1] * (clean.ndim - 1)))
-        return (1.0 - t) * clean + t * noise
+        return (1.0 - t) * clean + t * source
 
     @staticmethod
-    def training_target(clean: torch.Tensor, noise: torch.Tensor) -> torch.Tensor:
-        return noise - clean
+    def training_target(clean: torch.Tensor, source: torch.Tensor) -> torch.Tensor:
+        return source - clean
 
     def discretize_t(self, t_cont: torch.Tensor) -> torch.Tensor:
         """Map continuous t -> integer bucket ids for timestep embedding."""
@@ -56,16 +56,35 @@ class ActionFlowMatching:
         self,
         predict_velocity,
         *,
-        batch_size: int,
-        seq_len: int,
-        action_dim: int,
-        device: torch.device,
-        dtype: torch.dtype,
+        initial_state: torch.Tensor | None = None,
+        batch_size: int = 1,
+        seq_len: int = 1,
+        action_dim: int = 1,
+        device: torch.device | str | None = None,
+        dtype: torch.dtype = torch.float32,
     ) -> torch.Tensor:
-        """Euler integration from noise (t=1) to clean (t=0)."""
-        actions = torch.randn(batch_size, seq_len, action_dim, device=device, dtype=dtype)
+        """Euler integration from t=1 source to clean actions at t=0.
+
+        When ``initial_state`` is omitted, starts from Gaussian noise (DiT4DiT-style).
+        When provided (e.g. history hold-last prior), starts from that tensor.
+        """
+        if initial_state is None:
+            if device is None:
+                raise ValueError("denoise_euler requires device when initial_state is None")
+            actions = torch.randn(
+                int(batch_size),
+                int(seq_len),
+                int(action_dim),
+                device=device,
+                dtype=dtype,
+            )
+        else:
+            actions = initial_state.clone()
+        batch_size = int(actions.shape[0])
         num_steps = max(1, int(self.cfg.num_inference_timesteps))
         dt = 1.0 / float(num_steps)
+        device = actions.device
+        dtype = actions.dtype
         for step in range(num_steps):
             t_cont = 1.0 - step / float(num_steps)
             t_batch = torch.full((batch_size,), t_cont, device=device, dtype=dtype)

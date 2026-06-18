@@ -1,0 +1,20 @@
+# @package _global_
+# Ablation 3: VGGT multi-frame + DiT4DiT prefix/query action encoder.
+
+defaults:
+  - train_ablation_base
+  - _self_
+
+output_dir: ./experiments/ablation3_both_400step
+checkpoint_name: ablation3_both_400step
+
+data:
+  seq_len: 34
+
+model:
+  vggt_use_full_video: true
+  action_history_window: 5
+  action_future_horizon: 29
+  action_dit_config:
+    action_token_encoder: dit4dit_prefix_query
+    action_future_horizon: 29

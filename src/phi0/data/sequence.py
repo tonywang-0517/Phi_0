@@ -114,16 +114,29 @@ class SequenceDataset(Dataset):
             return self._item_from_native_frames([self.base[0]], padded=True)
 
         start = self.starts[idx % len(self.starts)]
+        return self.sample_at_start(start)
+
+    def sample_at_start(self, start: int, seq_len: int | None = None) -> Dict[str, Any]:
+        """Build a clip anchored at ``start`` with optional override ``seq_len``."""
+        seq_len = int(seq_len or self.seq_len)
         ds_name = self.base[start]["dataset"]
         native_fps = float(self.native_fps[ds_name])
-        native_span = native_span_frames(self.seq_len, self.control_fps, native_fps)
+        native_span = native_span_frames(seq_len, self.control_fps, native_fps)
         clip_end = self._clip_end_for_start(start)
         native_frames = self._load_native_clip(start, native_span, clip_end)
         actual_native = min(native_span, max(0, clip_end - start))
         padded = actual_native < native_span
-        return self._item_from_native_frames(native_frames, padded=padded)
+        item = self._item_from_native_frames(native_frames, padded=padded, seq_len=seq_len)
+        item["native_start"] = int(start)
+        return item
 
-    def _item_from_native_frames(self, native_frames: List[Dict[str, Any]], *, padded: bool) -> Dict[str, Any]:
+    def _item_from_native_frames(
+        self,
+        native_frames: List[Dict[str, Any]],
+        *,
+        padded: bool,
+        seq_len: int | None = None,
+    ) -> Dict[str, Any]:
         src_len = len(native_frames)
         if src_len == 0:
             raise ValueError("empty native clip")
@@ -139,16 +152,17 @@ class SequenceDataset(Dataset):
             ]
         )
 
-        action_ctrl = resample_action_sequence(actions, src_len, self.seq_len)
-        dim_pad_ctrl = resample_bool_sequence(dim_pad, src_len, self.seq_len)
-        images_ctrl = resample_image_sequence(images, src_len, self.seq_len)
+        seq_len_eff = int(seq_len or self.seq_len)
+        action_ctrl = resample_action_sequence(actions, src_len, seq_len_eff)
+        dim_pad_ctrl = resample_bool_sequence(dim_pad, src_len, seq_len_eff)
+        images_ctrl = resample_image_sequence(images, src_len, seq_len_eff)
 
         native_pad = torch.zeros(src_len, dtype=torch.bool)
         if padded:
             native_pad[-1] = True
-        pad_ctrl = resample_bool_sequence(native_pad, src_len, self.seq_len)
+        pad_ctrl = resample_bool_sequence(native_pad, src_len, seq_len_eff)
 
-        video_idx = self.video_control_indices
+        video_idx = video_sample_control_indices(seq_len_eff, self.action_video_freq_ratio)
         out: Dict[str, Any] = {
             "dataset": native_frames[0]["dataset"],
             "idx": native_frames[0]["idx"],

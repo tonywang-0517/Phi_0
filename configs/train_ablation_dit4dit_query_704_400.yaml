@@ -1,0 +1,16 @@
+# @package _global_
+# Ablation: DiT4DiT prefix/query action input + ACT, same 4+29 horizon @ 704x1280.
+
+defaults:
+  - train_ablation_base
+  - _self_
+
+output_dir: ./experiments/ablation_dit4dit_query_704_400step
+checkpoint_name: ablation_dit4dit_query_704_400step
+
+model:
+  action_history_window: 4
+  action_future_horizon: 29
+  action_dit_config:
+    action_token_encoder: dit4dit_prefix_query
+    action_future_horizon: 29

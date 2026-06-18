@@ -10,12 +10,14 @@ extract_layer: 17  # DiT4DiT default (framework.cosmos25.extract_layer)
 freeze_text_encoder: true
 freeze_vae: true
 freeze_transformer: true  # action-only (lambda_video=0): freeze Cosmos; set false for joint DiT4DiT FT
+cosmos_hook_early_exit: true  # action-only / lambda_video=0: stop Cosmos DiT after extract_layer hook
 # Legacy override: set true to freeze entire video tower (text+vae+transformer)
 freeze_video_tower: null
 detach_action_context: true
 # Cosmos: multi-frame latent clip for action hook (DiT4DiT-style video history).
 action_context_mode: full_clip  # first_frame | full_clip
 past_action_window_size: 4  # proprio prefix: past normalized actions (history output)
+vggt_use_full_video: true  # dual VGGT: multi-frame register context
 # Deterministic Cosmos capture (sigma=0) for train/eval/deploy reproducibility.
 capture_stochastic: false
 # VAE encode: mode/mean instead of sample for deterministic latents.
@@ -25,8 +27,8 @@ conditional_frame_timestep: 0.0001
 enable_cosmos_gradient_checkpointing: false
 raw_action_dim: 256
 
-# Action: DiT4DiT-style chunk prediction with proprio prefix + multi-frame Cosmos hook
-action_head: act  # act (default) | fm (legacy flow matching)
+# Action: history-conditioned chunk prediction with multi-frame Cosmos hook
+action_head: act  # act (default) | fm (conditional flow history -> future)
 
 action_dit_config:
   hidden_dim: 1024
@@ -65,3 +67,17 @@ vggt:
   freeze: true
 
 # Video: DiT4DiT latent future rectified-flow (updates Cosmos transformer; hook detached for action)
+video_fm:
+  num_inference_timesteps: 1  # DiT4DiT training FM (flow matching single step)
+  preview_inference_timesteps: 36
+  inference_conditional_frame_timestep: 0.1
+  inference_guidance_scale: 7.0
+  num_pixel_frames_out: null
+  num_latent_conditional_frames: 1  # Single current-frame conditioning for Cosmos latent context
+  flow_time_distribution: logit_normal
+  flow_high_sigma_ratio: 0.05
+  flow_high_sigma_min: 0.98
+
+# Inference-only switches (training/deploy ignore unless explicitly enabled).
+inference:
+  generate_video: false  # official Cosmos I2W pipeline for debugging / visualization
