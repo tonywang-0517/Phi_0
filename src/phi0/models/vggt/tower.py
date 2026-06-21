@@ -2,7 +2,7 @@
 
 Inference-only: ``extract_register_context`` runs under ``@torch.no_grad()`` with
 ``freeze=True`` (aggregator weights ``requires_grad=False``, ``model.eval()``).
-Gradients flow only through the trainable ``vggt_embedding`` projection in the action head.
+Gradients flow only through the trainable ``vggt_embedding`` linear projection in the action head.
 """
 
 from __future__ import annotations

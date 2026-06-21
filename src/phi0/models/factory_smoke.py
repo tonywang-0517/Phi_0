@@ -1,10 +1,10 @@
-"""Lightweight Phi_0 factory for action-only smoke tests (no Cosmos download)."""
+"""Lightweight Phi_0 factory for action-only smoke tests (no VLM download)."""
 
 from __future__ import annotations
 
 import torch
 
-from phi0.models.cosmos.video_tower import SmokeVideoTower
+from phi0.models.vlm.tower import SmokeVLMTower
 from phi0.models.phi0 import Phi0, build_action_expert
 from phi0.schema.draw_schema import D_RAW
 
@@ -17,7 +17,7 @@ def create_phi0_action_only_smoke(
     hidden_dim: int = 1024,
     text_dim: int = 512,
     action_head: str = "fm",
-    past_action_window_size: int = 2,
+    past_action_window_size: int = 1,
 ) -> Phi0:
     """Minimal Phi0 for CPU smoke tests without HuggingFace downloads."""
     action_dit_config = {
@@ -33,7 +33,7 @@ def create_phi0_action_only_smoke(
         "interleave_self_attention": True,
         "proprio_window": int(past_action_window_size),
     }
-    video_tower = SmokeVideoTower(
+    vlm_tower = SmokeVLMTower(
         action_context_dim=text_dim,
         num_context_tokens=16,
         device=device,
@@ -47,8 +47,8 @@ def create_phi0_action_only_smoke(
         torch_dtype=torch_dtype,
     )
     return Phi0(
-        video_tower=video_tower,
         action_expert=action_expert,
+        vlm_tower=vlm_tower,
         device=device,
         torch_dtype=torch_dtype,
         loss_lambda_video=0.0,

@@ -27,6 +27,7 @@ def sequence_dataset_from_cfg(base: Dataset, data_cfg: Mapping[str, Any]) -> "Se
         control_fps=float(data_cfg.get("control_fps", 20.0)),
         action_video_freq_ratio=int(data_cfg.get("action_video_freq_ratio", 2)),
         native_fps=native_fps,
+        future_action_steps=int(data_cfg.get("future_action_steps", 0)) or None,
     )
 
 
@@ -42,6 +43,7 @@ class SequenceDataset(Dataset):
         control_fps: float = 20.0,
         action_video_freq_ratio: int = 2,
         native_fps: Optional[Mapping[str, float]] = None,
+        future_action_steps: Optional[int] = None,
     ):
         self.base = base
         self.seq_len = int(seq_len)
@@ -49,6 +51,9 @@ class SequenceDataset(Dataset):
         self.control_fps = float(control_fps)
         self.action_video_freq_ratio = max(1, int(action_video_freq_ratio))
         self.native_fps = dict(native_fps or DEFAULT_DATASET_NATIVE_FPS)
+        self.future_action_steps = (
+            int(future_action_steps) if future_action_steps is not None else None
+        )
         self.video_control_indices = video_sample_control_indices(
             self.seq_len, self.action_video_freq_ratio
         )
@@ -142,7 +147,15 @@ class SequenceDataset(Dataset):
             raise ValueError("empty native clip")
 
         actions = torch.stack([f["action"][0] for f in native_frames])
-        images = torch.stack([f["images"]["ego_view"][0] for f in native_frames])
+        robot_actions = None
+        if "robot_action_7d" in native_frames[0]:
+            robot_actions = torch.stack([f["robot_action_7d"][0] for f in native_frames])
+        proprio_abs = None
+        delta_actions = None
+        if "robot_proprio_7d" in native_frames[0]:
+            proprio_abs = torch.stack([f["robot_proprio_7d"][0] for f in native_frames])
+        if "robot_delta_7d" in native_frames[0]:
+            delta_actions = torch.stack([f["robot_delta_7d"][0] for f in native_frames])
         dim_pad = torch.stack(
             [
                 f["action_dim_is_pad"].view(-1)
@@ -153,21 +166,37 @@ class SequenceDataset(Dataset):
         )
 
         seq_len_eff = int(seq_len or self.seq_len)
+        video_idx = video_sample_control_indices(seq_len_eff, self.action_video_freq_ratio)
+        if src_len == seq_len_eff:
+            images_out = torch.stack(
+                [native_frames[i]["images"]["ego_view"][0] for i in video_idx]
+            )
+        else:
+            images = torch.stack([f["images"]["ego_view"][0] for f in native_frames])
+            images_ctrl = resample_image_sequence(images, src_len, seq_len_eff)
+            images_out = images_ctrl[video_idx]
         action_ctrl = resample_action_sequence(actions, src_len, seq_len_eff)
+        robot_ctrl = None
+        if robot_actions is not None:
+            robot_ctrl = resample_action_sequence(robot_actions, src_len, seq_len_eff)
+        proprio_ctrl = None
+        delta_ctrl = None
+        if proprio_abs is not None:
+            proprio_ctrl = resample_action_sequence(proprio_abs, src_len, seq_len_eff)
+        if delta_actions is not None:
+            delta_ctrl = resample_action_sequence(delta_actions, src_len, seq_len_eff)
         dim_pad_ctrl = resample_bool_sequence(dim_pad, src_len, seq_len_eff)
-        images_ctrl = resample_image_sequence(images, src_len, seq_len_eff)
 
         native_pad = torch.zeros(src_len, dtype=torch.bool)
         if padded:
             native_pad[-1] = True
         pad_ctrl = resample_bool_sequence(native_pad, src_len, seq_len_eff)
 
-        video_idx = video_sample_control_indices(seq_len_eff, self.action_video_freq_ratio)
         out: Dict[str, Any] = {
             "dataset": native_frames[0]["dataset"],
             "idx": native_frames[0]["idx"],
             "task": native_frames[0]["task"],
-            "images": {"ego_view": images_ctrl[video_idx]},
+            "images": {"ego_view": images_out},
             "image_is_pad": pad_ctrl[video_idx].clone(),
             "action": action_ctrl,
             "action_is_pad": pad_ctrl.clone(),
@@ -176,11 +205,32 @@ class SequenceDataset(Dataset):
             "action_video_freq_ratio": self.action_video_freq_ratio,
             "video_control_indices": video_idx,
         }
+        if robot_ctrl is not None:
+            out["robot_action_7d"] = robot_ctrl
+        if proprio_ctrl is not None and delta_ctrl is not None:
+            future_steps = self.future_action_steps
+            if future_steps is None:
+                future_steps = max(1, seq_len_eff - int(proprio_ctrl.shape[0]) + 1)
+            past_w = int(seq_len_eff - int(future_steps))
+            if past_w <= 0:
+                raise ValueError(
+                    f"Invalid proprio/delta split: seq_len={seq_len_eff}, future={future_steps}"
+                )
+            out["robot_proprio_7d"] = proprio_ctrl[:past_w]
+            # VLA-Adapter: first future step pairs with last proprio (current) control index.
+            future_end = int(seq_len_eff - 1)
+            future_start = int(past_w - 1)
+            if future_end <= future_start:
+                raise ValueError(
+                    f"Invalid future delta slice: start={future_start}, end={future_end}, "
+                    f"seq_len={seq_len_eff}, past_w={past_w}"
+                )
+            out["robot_future_delta_7d"] = delta_ctrl[future_start:future_end]
         return out
 
     @staticmethod
     def collate_fn(batch: List[Dict[str, Any]]) -> Dict[str, Any]:
-        return {
+        out: Dict[str, Any] = {
             "dataset": [b["dataset"] for b in batch],
             "idx": torch.tensor([b["idx"] for b in batch], dtype=torch.long),
             "task": [b["task"] for b in batch],
@@ -193,3 +243,10 @@ class SequenceDataset(Dataset):
             "action_video_freq_ratio": batch[0].get("action_video_freq_ratio"),
             "video_control_indices": batch[0].get("video_control_indices"),
         }
+        if "robot_action_7d" in batch[0]:
+            out["robot_action_7d"] = torch.stack([b["robot_action_7d"] for b in batch])
+        if "robot_proprio_7d" in batch[0]:
+            out["robot_proprio_7d"] = torch.stack([b["robot_proprio_7d"] for b in batch])
+        if "robot_future_delta_7d" in batch[0]:
+            out["robot_future_delta_7d"] = torch.stack([b["robot_future_delta_7d"] for b in batch])
+        return out

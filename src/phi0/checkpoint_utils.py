@@ -7,7 +7,7 @@ from typing import Any, Dict, Optional, Union
 
 import torch
 import torch.nn as nn
-from omegaconf import DictConfig, OmegaConf
+from omegaconf import DictConfig, ListConfig, OmegaConf
 
 logger = logging.getLogger(__name__)
 
@@ -33,7 +33,7 @@ def _prune_unknown_keys(src: DictConfig, template: DictConfig) -> None:
         else:
             child_src = src[key]
             child_tpl = template[key]
-            if OmegaConf.is_config(child_src) and OmegaConf.is_config(child_tpl):
+            if isinstance(child_src, DictConfig) and isinstance(child_tpl, DictConfig):
                 _prune_unknown_keys(child_src, child_tpl)
 
 
@@ -77,10 +77,61 @@ def checkpoint_paths(
     return step_path, latest_path, legacy_alias
 
 
+def resolve_resume_checkpoint(cfg: Union[DictConfig, Dict[str, Any]]) -> Optional[Any]:
+    """Pick resume path: explicit ``resume_ckpt`` or ``{output_dir}/{checkpoint_name}_latest.pt``."""
+    from pathlib import Path
+
+    resume_ckpt = cfg.get("resume_ckpt") if hasattr(cfg, "get") else None
+    if resume_ckpt is not None and str(resume_ckpt).lower() not in {"", "null", "none"}:
+        return Path(str(resume_ckpt))
+
+    auto = cfg.get("auto_resume", False) if hasattr(cfg, "get") else False
+    if not bool(auto):
+        return None
+
+    out_dir = Path(str(cfg.get("output_dir", ".")))
+    name = str(cfg.get("checkpoint_name", "phi0"))
+    latest = out_dir / f"{name}_latest.pt"
+    if latest.is_file():
+        return latest
+    return None
+
+
+def unwrap_compiled_module(module: nn.Module) -> nn.Module:
+    """Return inner module when wrapped by ``torch.compile``."""
+    orig = getattr(module, "_orig_mod", None)
+    return orig if isinstance(orig, nn.Module) else module
+
+
+def remove_ddp_prefix_from_state_dict(state_dict: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
+    """Strip ``module.`` prefixes saved from a DDP-wrapped model (VLA-Adapter helper)."""
+    out: Dict[str, torch.Tensor] = {}
+    for key, value in state_dict.items():
+        if key.startswith("module."):
+            out[key[7:]] = value
+        else:
+            out[key] = value
+    return out
+
+
+def unwrap_training_module(model: nn.Module) -> nn.Module:
+    """Unwrap DDP / ``torch.compile`` wrappers for attribute access and checkpoint I/O."""
+    from torch.nn.parallel import DistributedDataParallel as DDP
+
+    model = unwrap_compiled_module(model)
+    if isinstance(model, DDP):
+        return model.module
+    return model
+
+
 def extract_action_expert_state_dict(model: nn.Module) -> Dict[str, torch.Tensor]:
     """Strip ``action_expert.*`` weights for compact checkpoints."""
-    prefix = "action_expert."
-    return {k[len(prefix) :]: v for k, v in model.state_dict().items() if k.startswith(prefix)}
+    model = unwrap_training_module(model)
+    expert = getattr(model, "action_expert", None)
+    if expert is None:
+        return {}
+    expert = unwrap_compiled_module(expert)
+    return dict(expert.state_dict())
 
 
 def load_action_expert_state_dict(model: nn.Module, state_dict: Dict[str, torch.Tensor], *, source: str = "") -> None:

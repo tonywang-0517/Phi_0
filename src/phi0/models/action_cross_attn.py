@@ -4,7 +4,13 @@ from __future__ import annotations
 
 from typing import Literal, Optional
 
-ActionCrossAttnMode = Literal["interleave_cosmos", "dual_cosmos_vggt", "all_cosmos"]
+ActionCrossAttnMode = Literal["interleave_vlm", "dual_vlm_vggt", "all_vlm", "self_only"]
+
+_LEGACY_MODE_MAP = {
+    "interleave_cosmos": "interleave_vlm",
+    "dual_cosmos_vggt": "dual_vlm_vggt",
+    "all_cosmos": "all_vlm",
+}
 
 
 def resolve_action_cross_attn_mode(
@@ -15,22 +21,25 @@ def resolve_action_cross_attn_mode(
     """Resolve mode from explicit config or legacy ``interleave_self_attention``."""
     if action_cross_attn_mode is not None:
         key = str(action_cross_attn_mode).strip().lower()
-        if key in {"interleave_cosmos", "dual_cosmos_vggt", "all_cosmos"}:
+        key = _LEGACY_MODE_MAP.get(key, key)
+        if key in {"interleave_vlm", "dual_vlm_vggt", "all_vlm", "self_only"}:
             return key  # type: ignore[return-value]
         raise ValueError(
             f"Unknown action_cross_attn_mode={action_cross_attn_mode!r}; "
-            "expected interleave_cosmos | dual_cosmos_vggt | all_cosmos"
+            "expected interleave_vlm | dual_vlm_vggt | all_vlm | self_only"
         )
     if interleave_self_attention is False:
-        return "all_cosmos"
-    return "interleave_cosmos"
+        return "all_vlm"
+    return "interleave_vlm"
 
 
 def cross_attn_target(mode: ActionCrossAttnMode, block_idx: int) -> Optional[str]:
-    """Return cross-attn context key for a block: cosmos, vggt, or None."""
-    if mode == "all_cosmos":
-        return "cosmos"
-    if mode == "dual_cosmos_vggt":
-        return "cosmos" if block_idx % 2 == 0 else "vggt"
-    # interleave_cosmos: even layers cross-attend Cosmos, odd self-only.
-    return "cosmos" if block_idx % 2 == 0 else None
+    """Return cross-attn context key for a block: vlm, vggt, or None."""
+    if mode == "self_only":
+        return None
+    if mode == "all_vlm":
+        return "vlm"
+    if mode == "dual_vlm_vggt":
+        return "vlm" if block_idx % 2 == 0 else "vggt"
+    # interleave_vlm: even layers cross-attend VLM, odd self-only.
+    return "vlm" if block_idx % 2 == 0 else None

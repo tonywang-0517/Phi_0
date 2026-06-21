@@ -56,7 +56,7 @@ class ActionFMDiT(nn.Module):
             action_cross_attn_mode,
             interleave_self_attention=interleave_self_attention,
         )
-        self.interleave_self_attention = self.action_cross_attn_mode == "interleave_cosmos"
+        self.interleave_self_attention = self.action_cross_attn_mode == "interleave_vlm"
         self.add_pos_embed = bool(add_pos_embed)
         self.proprio_window = int(proprio_window)
 
@@ -65,16 +65,14 @@ class ActionFMDiT(nn.Module):
             nn.Linear(raw_action_dim, hidden_dim) if self.proprio_window > 0 else None
         )
         self.output_proj = nn.Linear(hidden_dim, raw_action_dim)
-        self.text_embedding = nn.Sequential(
-            nn.Linear(text_dim, hidden_dim),
-            nn.GELU(approximate="tanh"),
-            nn.Linear(hidden_dim, hidden_dim),
+        self.text_embedding = (
+            None if int(text_dim) == int(hidden_dim) else nn.Linear(text_dim, hidden_dim, bias=True)
         )
-        if self.action_cross_attn_mode == "dual_cosmos_vggt":
-            self.vggt_embedding = nn.Sequential(
-                nn.Linear(self.vggt_dim, hidden_dim),
-                nn.GELU(approximate="tanh"),
-                nn.Linear(hidden_dim, hidden_dim),
+        if self.action_cross_attn_mode == "dual_vlm_vggt":
+            self.vggt_embedding = (
+                None
+                if int(self.vggt_dim) == int(hidden_dim)
+                else nn.Linear(self.vggt_dim, hidden_dim, bias=True)
             )
         else:
             self.vggt_embedding = None
@@ -132,9 +130,16 @@ class ActionFMDiT(nn.Module):
         return cross_attn_target(self.action_cross_attn_mode, block_idx)
 
     def _embed_vggt_context(self, vggt_context: torch.Tensor) -> torch.Tensor:
+        if self.action_cross_attn_mode != "dual_vlm_vggt":
+            raise RuntimeError("_embed_vggt_context requires dual_vlm_vggt mode.")
         if self.vggt_embedding is None:
-            raise RuntimeError("vggt_embedding is only defined for dual_cosmos_vggt mode.")
+            return vggt_context
         return self.vggt_embedding(vggt_context)
+
+    def _embed_vlm_context(self, context: torch.Tensor) -> torch.Tensor:
+        if self.text_embedding is None:
+            return context
+        return self.text_embedding(context)
 
     def _encode_fm_action_tokens(
         self,
@@ -198,7 +203,7 @@ class ActionFMDiT(nn.Module):
                 raise ValueError("During training, FM timestep length must match batch_size.")
             timestep = timestep.expand(batch_size)
 
-        if context_mask is None:
+        if context_mask is None and self.action_cross_attn_mode != "self_only":
             context_mask = torch.ones(
                 (batch_size, context.shape[1]), dtype=torch.bool, device=context.device
             )
@@ -209,16 +214,20 @@ class ActionFMDiT(nn.Module):
 
         tokens, meta = self._encode_fm_action_tokens(action_tokens, timestep, proprio_tokens)
         total_len = meta["total_seq_len"]
-        context_attn_mask = context_mask.unsqueeze(1).expand(-1, total_len, -1)
 
-        if context_emb is None:
-            context_emb = self.text_embedding(context)
+        if self.action_cross_attn_mode == "self_only":
+            context_emb = None
+            context_attn_mask = None
+        else:
+            context_attn_mask = context_mask.unsqueeze(1).expand(-1, total_len, -1)
+            if context_emb is None:
+                context_emb = self._embed_vlm_context(context)
 
         vggt_emb = vggt_context_emb
         vggt_attn_mask = None
-        if self.action_cross_attn_mode == "dual_cosmos_vggt":
+        if self.action_cross_attn_mode == "dual_vlm_vggt":
             if vggt_context is None and vggt_emb is None:
-                raise ValueError("dual_cosmos_vggt requires vggt_context or vggt_context_emb.")
+                raise ValueError("dual_vlm_vggt requires vggt_context or vggt_context_emb.")
             if vggt_emb is None:
                 vggt_emb = self._embed_vggt_context(vggt_context)
             if vggt_context_mask is None:
@@ -286,7 +295,7 @@ class ActionFMDiT(nn.Module):
         x = block.gate(x, gate_msa, attn_out)
 
         target = self._cross_attn_target(block_idx)
-        if target == "cosmos":
+        if target == "vlm":
             x = x + block.cross_attn(block.norm3(x), context, ctx_mask=ctx_mask)
         elif target == "vggt":
             if vggt_context is None:

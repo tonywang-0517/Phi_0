@@ -1,0 +1,24 @@
+# @package _global_
+# Ablation 3: vlm_only, effective batch=128 via 4-GPU DDP (32/GPU), LR=1e-4.
+
+defaults:
+  - train_libero_spatial_act_delta_15k_single_vlm_only
+  - _self_
+
+output_dir: ./experiments/libero_spatial_vlm_only_15k_single_bs128
+checkpoint_name: libero_spatial_vlm_only_15k_single_bs128
+
+# per-GPU batch; torchrun ×4 → effective_batch=128
+batch_size: 32
+distributed: true
+ddp_drop_last: true
+ddp_find_unused_parameters: true
+
+num_workers: 8
+prefetch_factor: 4
+train_cpu_prefetch: 4
+
+lr_scale: none
+learning_rate_action: 1.0e-4
+learning_rate_warmup_steps: 1000
+learning_rate_scheduler: cosine

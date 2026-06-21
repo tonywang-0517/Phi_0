@@ -1,0 +1,27 @@
+# LIBERO spatial RLDS (OpenVLA modified_libero_rlds)
+dataset: libero_spatial
+libero_suite: libero_spatial
+libero_rlds_root: ./data/libero/modified_libero_rlds
+libero_max_episodes: null
+libero_max_shards: null
+
+control_fps: 20.0
+action_video_freq_ratio: 2
+dataset_native_fps:
+  libero_spatial: 20.0
+clip_stride: 4
+# seq_len = 1 current proprio + 8 future delta chunk.
+seq_len: 9
+future_action_steps: 8
+libero_delta_eef: true
+libero_proprio_absolute: true
+libero_absolute_eef: false
+normalize: true
+action_norm_mode: bounds_q99
+proprio_norm_mode: z-score
+action_stats_path: ./data/libero/libero_spatial_delta_action_stats.json
+proprio_stats_path: ./data/libero/libero_spatial_eef_action_stats.json
+auto_compute_action_stats: true
+cache_video: false
+libero_cache_native_frames: true
+mono_camera: true

@@ -40,9 +40,10 @@ def test_training_loss_act():
     assert model.action_fm is None
     b, t, d = 1, 4, model.action_expert.raw_action_dim
     sample = {
-        "video": torch.rand(b, 3, 3, 480, 640) * 2.0 - 1.0,
-        "context": torch.randn(1, 4, model.text_dim),
-        "context_mask": torch.ones(1, 4, dtype=torch.bool),
+        "input_ids": torch.ones(b, 8, dtype=torch.long),
+        "attention_mask": torch.ones(b, 8, dtype=torch.bool),
+        "pixel_values": torch.zeros(b, 16, 512),
+        "image_grid_thw": torch.tensor([[1, 16, 16]] * b),
         "action": torch.randn(b, t, d),
         "action_is_pad": torch.zeros(b, t, dtype=torch.bool),
         "action_dim_is_pad": None,

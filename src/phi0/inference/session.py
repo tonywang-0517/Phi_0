@@ -1,4 +1,4 @@
-"""Inference session + eval caches (prompt / clip vision / chunk action predict)."""
+"""Inference session + eval caches (VLM context / chunk action predict)."""
 
 from __future__ import annotations
 
@@ -20,47 +20,52 @@ def resolve_deploy_action_chunk_size(
     if getattr(model, "uses_history_action_input", lambda: False)():
         w = int(getattr(model, "action_history_window", 0) or 0)
     else:
-        w = int(getattr(model, "past_action_window_size", 4))
+        w = int(getattr(model, "past_action_window_size", 1))
     if seq_len is None:
-        seq_len = 33 if w <= 4 else w * 2
+        seq_len = 9 if w <= 1 else (24 if w == 5 else w * 2)
     return max(1, int(seq_len) - w)
 
 
-def _cosmos_video_input(video: torch.Tensor) -> torch.Tensor:
-    """Single-frame Cosmos I2V conditioning (current control step)."""
-    if video.ndim != 5:
-        raise ValueError(f"video must be [B,3,T,H,W], got {tuple(video.shape)}")
-    return video[:, :, -1:, :, :]
-
-
-class PromptEmbedCache:
-    """Cache Cosmos text encoder outputs keyed by instruction string."""
+class VLMContextCache:
+    """Cache VLM action context keyed by instruction string (single-task eval)."""
 
     def __init__(self) -> None:
         self._store: Dict[str, Tuple[torch.Tensor, torch.Tensor]] = {}
 
-    def get(self, model, prompt: str) -> Tuple[torch.Tensor, torch.Tensor]:
-        if prompt not in self._store:
-            embeds, mask = model.encode_prompt(prompt)
-            self._store[prompt] = (embeds, mask)
-        return self._store[prompt]
-
-    def get_batch(self, model, prompts: List[str]) -> Tuple[torch.Tensor, torch.Tensor]:
-        if len(set(prompts)) == 1:
-            e, m = self.get(model, prompts[0])
-            if e.shape[0] == 1:
-                return e.expand(len(prompts), -1, -1), m.expand(len(prompts), -1)
-            return e, m
-        embeds, mask = model.encode_prompt(prompts)
-        return embeds, mask
+    def get(self, model, vlm_inputs: Dict[str, torch.Tensor]) -> Tuple[torch.Tensor, torch.Tensor]:
+        key = vlm_inputs.get("_cache_key", "")
+        if key and key in self._store:
+            return self._store[key]
+        if not model.uses_vlm_tower():
+            batch_size = int(vlm_inputs.get("input_ids", torch.zeros(1)).shape[0])
+            ctx, mask = model._dummy_action_context(
+                batch_size,
+                device=model.device,
+                dtype=model.torch_dtype,
+                text_dim=model.text_dim,
+            )
+        else:
+            ctx, mask = model.vlm_tower.extract_action_context(
+                vlm_inputs["input_ids"],
+                vlm_inputs["attention_mask"],
+                vlm_inputs["pixel_values"],
+                vlm_inputs["image_grid_thw"],
+            )
+        if key:
+            self._store[key] = (ctx, mask)
+        return ctx, mask
 
     def clear(self) -> None:
         self._store.clear()
 
 
+# Backward-compatible alias
+PromptEmbedCache = VLMContextCache
+
+
 @dataclass
 class ClipInputsCache:
-    """Lazy cache for ``build_inputs`` + Cosmos hook per clip index."""
+    """Lazy cache for ``build_inputs`` + VLM context per clip index."""
 
     _store: Dict[int, Dict[str, Any]] = field(default_factory=dict)
     hits: int = 0
@@ -73,7 +78,7 @@ class ClipInputsCache:
         seq_dataset,
         clip_idx: int,
         *,
-        prompt_cache: Optional[PromptEmbedCache] = None,
+        prompt_cache: Optional[VLMContextCache] = None,
         cache_action_context: bool = True,
     ) -> Dict[str, Any]:
         if clip_idx in self._store:
@@ -88,26 +93,26 @@ class ClipInputsCache:
         mb = prepare_model_batch(model, processor, batch, prompt_cache=prompt_cache)
         mb = {k: (v.to(model.device) if torch.is_tensor(v) else v) for k, v in mb.items()}
         inputs = model.build_inputs(mb)
-        if cache_action_context and getattr(model.video_tower, "transformer", None) is not None:
-            _, action_ctx, action_ctx_mask = model.video_tower.forward_joint_step(
-                _cosmos_video_input(inputs["video"]),
-                inputs["context"],
-                compute_video_loss=False,
+        if cache_action_context and "action_ctx" not in inputs:
+            inputs["action_ctx"], inputs["action_ctx_mask"] = model._resolve_action_context(
+                inputs=inputs
             )
-            inputs["action_ctx"] = action_ctx
-            inputs["action_ctx_mask"] = action_ctx_mask
-        if model.uses_dual_vggt_cross_attn() and "video" in inputs:
-            vggt_ctx, vggt_ctx_mask = model._resolve_vggt_context(inputs["video"], inputs=inputs)
-            inputs["vggt_ctx"] = vggt_ctx
-            inputs["vggt_ctx_mask"] = vggt_ctx_mask
+        if model.uses_dual_vggt_cross_attn() and "vggt_ctx" not in inputs:
+            if mb.get("vggt_video") is not None:
+                vggt_ctx, vggt_ctx_mask = model._resolve_vggt_context(
+                    mb["vggt_video"], inputs=mb
+                )
+                inputs["vggt_ctx"] = vggt_ctx
+                inputs["vggt_ctx_mask"] = vggt_ctx_mask
         if "action_ctx" in inputs:
-            context_emb, vggt_context_emb = model._embed_action_contexts(
-                inputs["action_ctx"],
-                inputs.get("vggt_ctx"),
-            )
-            inputs["context_emb"] = context_emb
-            if vggt_context_emb is not None:
-                inputs["vggt_context_emb"] = vggt_context_emb
+            if model.uses_cross_attn_context():
+                context_emb, vggt_context_emb = model._embed_action_contexts(
+                    inputs["action_ctx"],
+                    inputs.get("vggt_ctx"),
+                )
+                inputs["context_emb"] = context_emb
+                if vggt_context_emb is not None:
+                    inputs["vggt_context_emb"] = vggt_context_emb
         self._store[clip_idx] = inputs
         return inputs
 
@@ -121,24 +126,23 @@ class ClipInputsCache:
 
 
 class ActionInferenceSession:
-    """Stateful deploy: Cosmos single-frame hook + proprio prefix + chunk predict."""
+    """Stateful deploy: Qwen3-VL context + current-frame proprio + chunk predict."""
 
     def __init__(
         self,
         model,
         processor=None,
         *,
-        deploy_seq_len: int = 33,
+        deploy_seq_len: int = 9,
         action_video_freq_ratio: int = 2,
         use_gt_proprio: bool = False,
         use_gt_history: bool | None = None,
         max_rgb_frames: int = 33,
     ) -> None:
-        del max_rgb_frames  # legacy arg; clip is passed explicitly on refresh
+        del max_rgb_frames, action_video_freq_ratio
         self.model = model
         self.processor = processor
         self.deploy_seq_len = int(deploy_seq_len)
-        self.action_video_freq_ratio = max(1, int(action_video_freq_ratio))
         if use_gt_history is not None:
             use_gt_proprio = bool(use_gt_history)
         self.use_gt_proprio = bool(use_gt_proprio)
@@ -148,15 +152,14 @@ class ActionInferenceSession:
         self.vggt_ctx: Optional[torch.Tensor] = None
         self.vggt_ctx_mask: Optional[torch.Tensor] = None
         self.vggt_context_emb: Optional[torch.Tensor] = None
-        self._prompt_embeds: Optional[torch.Tensor] = None
+        self._vlm_inputs: Optional[Dict[str, torch.Tensor]] = None
         self._video_clip: Optional[torch.Tensor] = None
+        w = int(getattr(model, "past_action_window_size", 1) or 1)
         if getattr(model, "uses_history_action_input", lambda: False)():
             history_window = int(getattr(model, "action_history_window", 0) or 0)
             self._proprio_history: Deque[torch.Tensor] = deque(maxlen=history_window or None)
         else:
-            self._proprio_history = deque(
-                maxlen=int(getattr(model, "past_action_window_size", 0)) or None
-            )
+            self._proprio_history = deque(maxlen=w or None)
         self._proprio_hold: Optional[torch.Tensor] = None
         self.video_refresh_count: int = 0
 
@@ -171,14 +174,13 @@ class ActionInferenceSession:
         self.vggt_ctx = None
         self.vggt_ctx_mask = None
         self.vggt_context_emb = None
-        self._prompt_embeds = None
+        self._vlm_inputs = None
         self._video_clip = None
         self._proprio_history.clear()
         self._proprio_hold = None
         self.video_refresh_count = 0
 
     def seed_proprio_from_normalized(self, action: torch.Tensor) -> None:
-        """Cold-start proprio with the current frame (replicated), not all-zero."""
         step = action.reshape(-1).detach().to(
             device=self.model.device, dtype=self.model.torch_dtype
         )
@@ -186,15 +188,12 @@ class ActionInferenceSession:
         self._proprio_history.clear()
 
     def seed_history_from_normalized(self, action: torch.Tensor) -> None:
-        """Deprecated alias for ``seed_proprio_from_normalized``."""
         self.seed_proprio_from_normalized(action)
 
     def set_proprio_gt(self, proprio: torch.Tensor) -> None:
-        """Set proprio prefix from GT normalized actions ``[W,D]`` or ``[1,W,D]``."""
+        w = int(getattr(self.model, "past_action_window_size", 1) or 1)
         if getattr(self.model, "uses_history_action_input", lambda: False)():
             w = int(getattr(self.model, "action_history_window", 0) or 0)
-        else:
-            w = int(getattr(self.model, "past_action_window_size", 0))
         if w <= 0:
             return
         if proprio.ndim == 2:
@@ -213,46 +212,119 @@ class ActionInferenceSession:
         self._proprio_hold = steps[-1]
 
     def set_history_gt(self, history: torch.Tensor) -> None:
-        """Deprecated alias for ``set_proprio_gt``."""
         self.set_proprio_gt(history)
 
-    def _update_action_context_from_video(self, video: torch.Tensor) -> None:
-        if self._prompt_embeds is None:
-            raise RuntimeError("Missing prompt embeds; call prefill before refresh.")
+    def _build_vlm_inputs_from_video(
+        self,
+        video: torch.Tensor,
+        instruction: str,
+    ) -> Dict[str, torch.Tensor]:
+        from phi0.models.vlm.preprocess import (
+            build_deploy_vlm_inputs_from_pixels,
+            video_bcthw_to_pixel_batch,
+        )
+
+        if video.ndim != 5:
+            raise ValueError(f"video must be [B,3,T,H,W], got {tuple(video.shape)}")
+        pixel = video_bcthw_to_pixel_batch(video)
+        processor_obj = getattr(self.model.vlm_tower, "processor", None)
+        if processor_obj is None:
+            batch = int(video.shape[0])
+            seq = int(getattr(self.model.vlm_tower, "num_context_tokens", 16))
+            device = video.device
+            pixel_stat = float(pixel.mean())
+            return {
+                "input_ids": torch.ones(batch, seq, dtype=torch.long, device=device),
+                "attention_mask": torch.ones(batch, seq, dtype=torch.bool, device=device),
+                "pixel_values": torch.full((batch, 1), pixel_stat, device=device),
+                "image_grid_thw": torch.ones(batch, 3, dtype=torch.long, device=device),
+            }
+        return build_deploy_vlm_inputs_from_pixels(
+            processor_obj,
+            self.processor,
+            pixel.float(),
+            [instruction],
+            model_max_length=int(getattr(self.model, "prompt_max_length", 512)),
+        )
+
+    def _set_action_context(
+        self,
+        action_ctx: torch.Tensor,
+        action_ctx_mask: torch.Tensor,
+        *,
+        vggt_ctx: torch.Tensor | None = None,
+        vggt_ctx_mask: torch.Tensor | None = None,
+        context_emb: torch.Tensor | None = None,
+        vggt_context_emb: torch.Tensor | None = None,
+    ) -> None:
+        self.action_ctx = action_ctx
+        self.action_ctx_mask = action_ctx_mask
+        if self.model.uses_cross_attn_context():
+            if context_emb is None or (
+                vggt_context_emb is None and vggt_ctx is not None
+            ):
+                context_emb, vggt_context_emb = self.model._embed_action_contexts(
+                    action_ctx,
+                    vggt_ctx,
+                    context_emb=context_emb,
+                    vggt_context_emb=vggt_context_emb,
+                )
+            self.context_emb = context_emb
+            self.vggt_context_emb = vggt_context_emb
+        else:
+            self.context_emb = None
+            self.vggt_context_emb = None
+        self.vggt_ctx = vggt_ctx
+        self.vggt_ctx_mask = vggt_ctx_mask
+
+    def _update_action_context_from_video(
+        self,
+        video: torch.Tensor,
+        instruction: str,
+        *,
+        vggt_video: torch.Tensor | None = None,
+    ) -> None:
         if video.ndim != 5:
             raise ValueError(f"video must be [B,3,T,H,W], got {tuple(video.shape)}")
         video = video.to(device=self.model.device, dtype=self.model.torch_dtype)
         self._video_clip = video.detach()
-        tower = self.model.video_tower
-        video_cosmos = _cosmos_video_input(video)
-        if getattr(tower, "transformer", None) is not None:
-            _, self.action_ctx, self.action_ctx_mask = tower.forward_joint_step(
-                video_cosmos,
-                self._prompt_embeds,
-                compute_video_loss=False,
+        batch_size = int(video.shape[0])
+
+        if not self.model.uses_vlm_tower():
+            self._vlm_inputs = None
+            action_ctx, action_ctx_mask = self.model._dummy_action_context(
+                batch_size,
+                device=self.model.device,
+                dtype=self.model.torch_dtype,
+                text_dim=self.model.text_dim,
             )
+            vggt_ctx, vggt_ctx_mask = None, None
         else:
-            self.action_ctx, self.action_ctx_mask = tower.extract_action_context(
-                video_cosmos, self._prompt_embeds
+            vlm_inputs = self._build_vlm_inputs_from_video(video, instruction)
+            for key, value in vlm_inputs.items():
+                vlm_inputs[key] = value.to(device=self.model.device)
+            self._vlm_inputs = vlm_inputs
+            action_ctx, action_ctx_mask = self.model.vlm_tower.extract_action_context(
+                vlm_inputs["input_ids"],
+                vlm_inputs["attention_mask"],
+                vlm_inputs["pixel_values"],
+                vlm_inputs["image_grid_thw"],
             )
-        if self.model.uses_dual_vggt_cross_attn():
-            self.vggt_ctx, self.vggt_ctx_mask = self.model._resolve_vggt_context(
-                video, inputs={"vggt_video": video}
-            )
-        else:
-            self.vggt_ctx = None
-            self.vggt_ctx_mask = None
-        self.context_emb, self.vggt_context_emb = self.model._embed_action_contexts(
-            self.action_ctx,
-            self.vggt_ctx,
-        )
+            vggt_src = vggt_video if vggt_video is not None else video[:, :, -1:, :, :]
+            if self.model.uses_dual_vggt_cross_attn():
+                vggt_ctx, vggt_ctx_mask = self.model._resolve_vggt_context(
+                    vggt_src, inputs={"vggt_video": vggt_src}
+                )
+            else:
+                vggt_ctx, vggt_ctx_mask = None, None
+
+        self._set_action_context(action_ctx, action_ctx_mask, vggt_ctx=vggt_ctx, vggt_ctx_mask=vggt_ctx_mask)
         self.video_refresh_count += 1
 
     def _proprio_tensor(self) -> Optional[torch.Tensor]:
+        w = int(getattr(self.model, "past_action_window_size", 1) or 1)
         if getattr(self.model, "uses_history_action_input", lambda: False)():
             w = int(getattr(self.model, "action_history_window", 0) or 0)
-        else:
-            w = int(getattr(self.model, "past_action_window_size", 0))
         if w <= 0:
             return None
         hist = list(self._proprio_history)
@@ -260,7 +332,7 @@ class ActionInferenceSession:
         if anchor is None:
             raise RuntimeError(
                 "Proprio deploy requires set_proprio_gt() or seed_proprio_from_normalized() "
-                "before predict(); all-zero proprio is not used."
+                "before predict()."
             )
         if len(hist) >= w:
             steps = hist[-w:]
@@ -269,7 +341,6 @@ class ActionInferenceSession:
         return torch.stack(steps, dim=0).unsqueeze(0)
 
     def _history_tensor(self) -> torch.Tensor:
-        """Deprecated alias for ``_proprio_tensor`` (history-mode ablations)."""
         tensor = self._proprio_tensor()
         if tensor is None:
             raise RuntimeError("proprio/history window must be positive for deploy.")
@@ -278,10 +349,9 @@ class ActionInferenceSession:
     def _update_proprio_history(self, pred_norm: torch.Tensor) -> None:
         if self.use_gt_proprio:
             return
+        w = int(getattr(self.model, "past_action_window_size", 1) or 1)
         if getattr(self.model, "uses_history_action_input", lambda: False)():
             w = int(getattr(self.model, "action_history_window", 0) or 0)
-        else:
-            w = int(getattr(self.model, "past_action_window_size", 0))
         if w <= 0:
             return
         if pred_norm.ndim == 3:
@@ -301,27 +371,26 @@ class ActionInferenceSession:
         self,
         video: torch.Tensor,
         *,
-        prompt_embeds: Optional[torch.Tensor] = None,
+        prompt: Optional[str] = None,
+        vggt_video: Optional[torch.Tensor] = None,
     ) -> None:
-        """Refresh Cosmos hook from training-aligned multi-frame clip ``[1,3,T,H,W]``."""
         if self.action_ctx is None:
-            raise RuntimeError("Call prefill_from_video_clip or prefill_from_clip_inputs before refresh.")
-        if prompt_embeds is not None:
-            self._prompt_embeds = prompt_embeds
-        self._update_action_context_from_video(video)
+            raise RuntimeError("Call prefill before refresh.")
+        if prompt is None:
+            raise ValueError("refresh_video_context_from_clip requires `prompt`.")
+        self._update_action_context_from_video(video, prompt, vggt_video=vggt_video)
 
     @torch.no_grad()
     def refresh_video_context(
         self,
         input_image: torch.Tensor,
         *,
-        prompt_embeds: Optional[torch.Tensor] = None,
+        prompt: Optional[str] = None,
     ) -> None:
-        """Legacy single-frame refresh (wraps as 1-frame clip)."""
         if input_image.ndim == 3:
             input_image = input_image.unsqueeze(0)
         clip = input_image.unsqueeze(2)
-        self.refresh_video_context_from_clip(clip, prompt_embeds=prompt_embeds)
+        self.refresh_video_context_from_clip(clip, prompt=prompt)
 
     @torch.no_grad()
     def prefill_from_video_clip(
@@ -329,18 +398,13 @@ class ActionInferenceSession:
         video: torch.Tensor,
         prompt: Optional[str] = None,
         *,
-        prompt_cache: Optional[PromptEmbedCache] = None,
+        prompt_cache: Optional[VLMContextCache] = None,
+        vggt_video: Optional[torch.Tensor] = None,
     ) -> None:
-        """Encode prompt once and capture hook from multi-frame clip ``[1,3,T,H,W]``."""
-        if prompt is not None and self.model.video_tower.text_encoder is not None:
-            if prompt_cache is not None:
-                prompt_embeds, _ = prompt_cache.get(self.model, prompt)
-            else:
-                prompt_embeds, _ = self.model.encode_prompt(prompt)
-            self._prompt_embeds = prompt_embeds
-            self._update_action_context_from_video(video)
-        else:
-            raise ValueError("prefill_from_video_clip requires `prompt` when text encoder is loaded.")
+        del prompt_cache
+        if prompt is None:
+            raise ValueError("prefill_from_video_clip requires `prompt`.")
+        self._update_action_context_from_video(video, prompt, vggt_video=vggt_video)
 
     @torch.no_grad()
     def prefill_from_image(
@@ -348,9 +412,8 @@ class ActionInferenceSession:
         input_image: torch.Tensor,
         prompt: Optional[str] = None,
         *,
-        prompt_cache: Optional[PromptEmbedCache] = None,
+        prompt_cache: Optional[VLMContextCache] = None,
     ) -> None:
-        """Legacy single-frame prefill (wraps as 1-frame clip)."""
         if input_image.ndim == 3:
             input_image = input_image.unsqueeze(0)
         clip = input_image.unsqueeze(2)
@@ -359,42 +422,45 @@ class ActionInferenceSession:
     @torch.no_grad()
     def prefill_from_clip_inputs(self, inputs: Dict[str, Any]) -> None:
         if "action_ctx" in inputs and "action_ctx_mask" in inputs:
-            self.action_ctx = inputs["action_ctx"]
-            self.action_ctx_mask = inputs["action_ctx_mask"]
-        elif getattr(self.model.video_tower, "transformer", None) is not None:
-            self._prompt_embeds = inputs["context"]
-            _, self.action_ctx, self.action_ctx_mask = self.model.video_tower.forward_joint_step(
-                _cosmos_video_input(inputs["video"]),
-                inputs["context"],
-                compute_video_loss=False,
+            action_ctx = inputs["action_ctx"]
+            action_ctx_mask = inputs["action_ctx_mask"]
+        elif all(k in inputs for k in ("input_ids", "attention_mask", "pixel_values", "image_grid_thw")):
+            action_ctx, action_ctx_mask = self.model._resolve_action_context(inputs=inputs)
+        elif not self.model.uses_vlm_tower():
+            batch_size = int(inputs.get("action", torch.zeros(1, 1, 1)).shape[0])
+            action_ctx, action_ctx_mask = self.model._dummy_action_context(
+                batch_size,
+                device=self.model.device,
+                dtype=self.model.torch_dtype,
+                text_dim=self.model.text_dim,
             )
         else:
-            raise ValueError("Cannot prefill: missing action context and no transformer.")
+            raise ValueError("Cannot prefill: missing VLM inputs or precomputed action_ctx.")
+        vggt_ctx = None
+        vggt_ctx_mask = None
         if self.model.uses_dual_vggt_cross_attn():
             if "vggt_ctx" in inputs and "vggt_ctx_mask" in inputs:
-                self.vggt_ctx = inputs["vggt_ctx"]
-                self.vggt_ctx_mask = inputs["vggt_ctx_mask"]
-            elif "vggt_video" in inputs or "video" in inputs:
-                self.vggt_ctx, self.vggt_ctx_mask = self.model._resolve_vggt_context(
-                    inputs.get("video"), inputs=inputs
+                vggt_ctx = inputs["vggt_ctx"]
+                vggt_ctx_mask = inputs["vggt_ctx_mask"]
+            elif inputs.get("vggt_video") is not None:
+                vggt_ctx, vggt_ctx_mask = self.model._resolve_vggt_context(
+                    inputs["vggt_video"], inputs=inputs
                 )
             else:
-                raise ValueError("dual_cosmos_vggt prefill requires video or vggt_ctx in inputs.")
-        else:
-            self.vggt_ctx = None
-            self.vggt_ctx_mask = None
-        self.context_emb, self.vggt_context_emb = self.model._embed_action_contexts(
-            self.action_ctx,
-            self.vggt_ctx,
+                raise ValueError("dual_vlm_vggt prefill requires vggt_video or vggt_ctx.")
+        self._set_action_context(
+            action_ctx,
+            action_ctx_mask,
+            vggt_ctx=vggt_ctx,
+            vggt_ctx_mask=vggt_ctx_mask,
             context_emb=inputs.get("context_emb"),
             vggt_context_emb=inputs.get("vggt_context_emb"),
         )
 
     @torch.no_grad()
     def predict(self, num_frames: int, *, denormalize: bool = False) -> torch.Tensor:
-        """Predict future action chunk [T, D] (or [B,T,D] if B>1)."""
         if self.action_ctx is None:
-            raise RuntimeError("Call prefill_from_video_clip or prefill_from_clip_inputs before predict().")
+            raise RuntimeError("Call prefill before predict().")
         batch_size = int(self.action_ctx.shape[0])
         prefix = self._proprio_tensor()
         pred = self.model.predict_action(
@@ -411,10 +477,7 @@ class ActionInferenceSession:
         )
         pred = zero_unsupervised_action_dims(pred)
         self._update_proprio_history(pred)
-        if batch_size == 1:
-            out = pred.squeeze(0)
-        else:
-            out = pred
+        out = pred.squeeze(0) if batch_size == 1 else pred
         if denormalize and self.processor is not None:
             if out.ndim == 2:
                 return self.processor.postprocess(out.unsqueeze(0)).squeeze(0)
@@ -429,7 +492,6 @@ class ActionInferenceSession:
         *,
         denormalize: bool = False,
     ) -> torch.Tensor:
-        """Predict in segments (caller refreshes video context between segments)."""
         segment_len = max(1, int(segment_len))
         chunks: List[torch.Tensor] = []
         remaining = int(num_frames)

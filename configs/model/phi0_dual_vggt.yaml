@@ -1,14 +1,13 @@
-# Phi_0 + dual cross-attn: even layers Cosmos hook, odd layers VGGT scene registers.
-# Inherits phi0_full; override ablation mode and enable frozen VGGT tower.
+# Phi_0 + dual cross-attn: even layers VLM, odd layers VGGT scene registers.
 
 defaults:
   - phi0_full
   - _self_
 
-vggt_use_full_video: true
+vggt_use_full_video: false
 
 action_dit_config:
-  action_cross_attn_mode: dual_cosmos_vggt
+  action_cross_attn_mode: dual_vlm_vggt
 
 vggt:
   enabled: true

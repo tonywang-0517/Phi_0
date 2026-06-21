@@ -1,0 +1,42 @@
+# LIBERO spatial ACT: frozen Cosmos (V2W hook) + VGGT, composite Cosmos prompt.
+
+defaults:
+  - train_full
+  - data: libero_spatial
+  - override /model: phi0_dual_vggt
+  - _self_
+
+output_dir: ./experiments/libero_spatial_act_200_v2w
+checkpoint_name: libero_spatial_act_200_v2w
+max_steps: 800
+save_every_steps: 100
+checkpoint_overwrite: true
+save_action_expert_only: true
+save_optimizer: false
+resume_ckpt: null
+fastwam_ckpt: null
+
+device: cuda
+batch_size: 4
+num_workers: 2
+repeated_action_steps: 1
+learning_rate_action: 1.5e-4
+learning_rate_backbone: 0.0
+
+model:
+  robot_action_dim: 7
+  prompt_max_length: 1536
+  action_head: act
+  freeze_transformer: true
+  past_action_window_size: 5
+  video_fm:
+    num_latent_conditional_frames: 2  # Video2World: 5-pixel cond tail
+  action_dit_config:
+    use_gradient_checkpointing: true
+  loss:
+    lambda_video: 0.0
+    lambda_action: 1.0
+    lambda_bone: 0.0
+    lambda_bone_hand: 0.0
+    lambda_bone_dir: 0.0
+    lambda_hand_mse: 0.0

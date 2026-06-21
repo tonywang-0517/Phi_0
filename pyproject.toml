@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "phi0"
 version = "0.1.0"
-description = "Phi_0: SMPL+H world-action model (Cosmos + FM/ACT action head)"
+description = "Phi_0: Qwen3-VL + ACT/FM action head with optional VGGT fusion"
 requires-python = ">=3.10"
 dependencies = [
   "accelerate>=1.12.0",
@@ -26,6 +26,7 @@ dependencies = [
   "torchvision>=0.20.0",
   "tqdm>=4.66.0",
   "transformers>=4.57.6",
+  "qwen-vl-utils>=0.0.14",
   "diffusers>=0.38.0",
 ]
 

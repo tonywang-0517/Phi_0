@@ -42,6 +42,8 @@ def dit4dit_preprocess_video(
         crop_w = max(1, int(round(w * float(crop_scale))))
         out = _center_crop_btchw(out, crop_h, crop_w)
     target_h, target_w = int(size[0]), int(size[1])
+    if crop_scale is None and out.shape[3] == target_h and out.shape[4] == target_w:
+        return out
     b, t, c, _, _ = out.shape
     flat = out.reshape(b * t, c, out.shape[3], out.shape[4])
     resized = F.interpolate(

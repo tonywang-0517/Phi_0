@@ -8,12 +8,18 @@ from typing import Any, Dict, List, Optional, Tuple
 import torch
 from torch.utils.data import ConcatDataset, Dataset
 
-from phi0.data.dit4dit_video import dit4dit_preprocess_video
 from phi0.data.egodex import EgoDexDataset
-from phi0.data.cosmos_video_size import DEFAULT_COSMOS_VIDEO_SIZE, cosmos_video_size_from_cfg
-from phi0.data.xperience import XperienceDataset
 from phi0.schema.draw_schema import D_RAW
 from phi0.data.action_stats import load_action_stats, stats_to_tensors
+from phi0.data.robot_action_norm import (
+    denormalize_robot7d,
+    normalize_robot7d,
+    processor_stats_dict,
+    stats_view_for_robot7d,
+)
+
+
+DEFAULT_VLM_IMAGE_SIZE = (180, 320)
 
 
 class Phi0MixedDataset(Dataset):
@@ -61,8 +67,10 @@ def build_overfit_datasets(
     egodex_max_frames: int = 32,
     xperience_video: str | Path | None = None,
     cache_video: bool = True,
-    image_size: Tuple[int, int] = DEFAULT_COSMOS_VIDEO_SIZE,
+    image_size: Tuple[int, int] = DEFAULT_VLM_IMAGE_SIZE,
 ) -> Phi0MixedDataset:
+    from phi0.data.xperience import XperienceDataset
+
     return Phi0MixedDataset(
         [
             XperienceDataset(
@@ -88,14 +96,20 @@ class Phi0Processor:
         action_dim: int = D_RAW,
         normalize: bool = True,
         *,
-        cosmos_video_size: Tuple[int, int] = DEFAULT_COSMOS_VIDEO_SIZE,
-        cosmos_video_crop_scale: Optional[float] = None,
+        vlm_image_size: Tuple[int, int] = DEFAULT_VLM_IMAGE_SIZE,
+        vlm_img_aug: bool = False,
     ):
         self.action_dim = action_dim
         self.normalize = normalize
-        self.cosmos_video_size = (int(cosmos_video_size[0]), int(cosmos_video_size[1]))
-        self.cosmos_video_crop_scale = cosmos_video_crop_scale
+        self.vlm_image_size = (int(vlm_image_size[0]), int(vlm_image_size[1]))
+        self.vlm_img_aug = bool(vlm_img_aug)
         self._is_train = True
+        self._vlm_transform = None
+        self._vlm_transform_key: tuple[Any, ...] | None = None
+        self.action_norm_mode = "z-score"
+        self.proprio_norm_mode = "z-score"
+        self.robot_action_semantics = ""
+        self.normalize_gripper = True
         self.register_stats()
 
     def register_stats(self, mean: Optional[torch.Tensor] = None, std: Optional[torch.Tensor] = None):
@@ -105,30 +119,60 @@ class Phi0Processor:
             std = torch.ones(self.action_dim)
         self.mean = mean
         self.std = std.clamp(min=1e-6)
+        self.action_q01 = mean.clone()
+        self.action_q99 = mean.clone()
 
     def register_stats_from_dict(self, stats: dict) -> None:
-        mean, std = stats_to_tensors(stats, self.action_dim)
+        mean, std, q01, q99 = stats_to_tensors(stats, self.action_dim)
         self.register_stats(mean, std)
+        self.action_q01 = q01
+        self.action_q99 = q99
+        self.action_norm_mode = str(stats.get("norm_mode", "z-score")).strip().lower()
+        self.robot_action_semantics = str(stats.get("robot_action_semantics", ""))
+        self.normalize_gripper = bool(stats.get("normalize_gripper", True))
 
     def load_stats_path(self, path: str | Path) -> None:
         self.register_stats_from_dict(load_action_stats(path))
 
+    def register_proprio_stats_from_dict(self, stats: dict) -> None:
+        mean, std, q01, q99 = stats_to_tensors(stats, self.action_dim)
+        self.proprio_mean = mean
+        self.proprio_std = std.clamp(min=1e-6)
+        self.proprio_q01 = q01
+        self.proprio_q99 = q99
+        self.proprio_norm_mode = str(stats.get("norm_mode", "z-score")).strip().lower()
+
+    def load_proprio_stats_path(self, path: str | Path) -> None:
+        self.register_proprio_stats_from_dict(load_action_stats(path))
+
     def stats_dict(self) -> dict:
-        return {
-            "version": 1,
-            "action_dim": self.action_dim,
-            "norm_mode": "z-score",
-            "mean": self.mean.detach().cpu().tolist(),
-            "std": self.std.detach().cpu().tolist(),
-        }
+        return processor_stats_dict(self)
 
     def train(self):
         self._is_train = True
+        self._vlm_transform = None
+        self._vlm_transform_key = None
         return self
 
     def eval(self):
         self._is_train = False
+        self._vlm_transform = None
+        self._vlm_transform_key = None
         return self
+
+    def vlm_image_transform(self):
+        """Cached Psi0-style VLM transform (invalidated on train/eval toggle)."""
+        key = (self.vlm_image_size, self.vlm_img_aug, self._is_train)
+        if self._vlm_transform_key != key:
+            from phi0.models.vlm.preprocess import make_psi0_vlm_image_transform
+
+            self._vlm_transform = make_psi0_vlm_image_transform(
+                self.vlm_image_size,
+                img_aug=self.vlm_img_aug,
+                training=self._is_train,
+            )
+            self._vlm_transform_key = key
+        return self._vlm_transform
 
     def _normalize_action(self, action: torch.Tensor) -> torch.Tensor:
         if not self.normalize:
@@ -138,15 +182,50 @@ class Phi0Processor:
         return (action - m) / s
 
     def _denormalize_action(self, action: torch.Tensor) -> torch.Tensor:
+        if self.action_norm_mode == "bounds_q99":
+            out = action.clone()
+            stats = stats_view_for_robot7d(self, proprio=False)
+            out[..., :7] = denormalize_robot7d(
+                action[..., :7],
+                stats,
+                denormalize_gripper=self.normalize_gripper,
+            )
+            if action.shape[-1] > 7:
+                m = self.mean[7:].to(action.device, dtype=action.dtype)
+                s = self.std[7:].to(action.device, dtype=action.dtype)
+                out[..., 7:] = action[..., 7:] * s + m
+            return out
         m = self.mean.to(action.device, dtype=action.dtype)
         s = self.std.to(action.device, dtype=action.dtype)
         return action * s + m
+
+    def denormalize_robot7d_future(self, pred_norm: torch.Tensor) -> torch.Tensor:
+        """Denormalize normalized future chunk to physical 7D controls."""
+        stats = stats_view_for_robot7d(self, proprio=False)
+        return denormalize_robot7d(
+            pred_norm[..., :7],
+            stats,
+            denormalize_gripper=False,
+        )
+
+    def normalize_robot7d_tensor(
+        self,
+        action_7d: torch.Tensor,
+        *,
+        proprio: bool = False,
+        normalize_gripper: Optional[bool] = None,
+    ) -> torch.Tensor:
+        stats = stats_view_for_robot7d(self, proprio=proprio)
+        grip = self.normalize_gripper if normalize_gripper is None else normalize_gripper
+        if proprio:
+            grip = True
+        return normalize_robot7d(action_7d, stats, normalize_gripper=grip)
 
     def preprocess(self, batch: Dict[str, Any]) -> Dict[str, Any]:
         action = batch["action"].float()
         action_norm = self._normalize_action(action)
 
-        pixel = batch["images"]["ego_view"]
+        pixel = batch["images"]["ego_view"].float()
         if pixel.ndim == 5:
             pass
         elif pixel.ndim == 6:
@@ -154,16 +233,17 @@ class Phi0Processor:
         else:
             raise ValueError(f"Expected ego_view [B,T,C,H,W] or [B,Cam,T,C,H,W], got {pixel.ndim}D")
 
-        cosmos_pixel = dit4dit_preprocess_video(
-            pixel.float(),
-            size=self.cosmos_video_size,
-            crop_scale=self.cosmos_video_crop_scale,
-        )
+        from phi0.models.vlm.preprocess import normalize_vlm_instruction
+
+        task = batch["task"]
+        if isinstance(task, str):
+            instruction = normalize_vlm_instruction(task)
+        else:
+            instruction = [normalize_vlm_instruction(t) for t in task]
 
         return {
-            "instruction": batch["task"],
-            "pixel_values": cosmos_pixel,
-            "pixel_values_native": pixel,
+            "instruction": instruction,
+            "pixel_values": pixel,
             "image_is_pad": batch["image_is_pad"],
             "action": action_norm,
             "action_is_pad": batch["action_is_pad"],

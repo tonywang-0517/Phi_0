@@ -1,0 +1,33 @@
+# @package _global_
+# ACT + VLM + VGGT dual cross-attn — 15k steps, 4-GPU DDP throughput-tuned.
+
+defaults:
+  - train_libero_spatial_act_delta_300
+  - _self_
+
+output_dir: ./experiments/libero_spatial_vlm_dual_15k
+checkpoint_name: libero_spatial_vlm_dual_15k
+max_steps: 15000
+save_every_steps: 2000
+checkpoint_overwrite: true
+auto_resume: false
+
+# Throughput: Psi0 uses per-GPU batch=16; keep same for fair LR/schedule comparison.
+batch_size: 16
+num_workers: 12
+prefetch_factor: 4
+train_cpu_prefetch: 8
+train_gpu_pipeline: true
+ddp_drop_last: true
+ddp_find_unused_parameters: false
+
+# Psi0 finetune-simple: lr=1e-4, warmup=1000, cosine (no sqrt batch scaling).
+lr_scale: none
+learning_rate_action: 1.0e-4
+learning_rate_warmup_steps: 1000
+learning_rate_scheduler: cosine
+learning_rate_backbone: 0.0
+weight_decay: 1.0e-6
+adam_beta1: 0.95
+adam_beta2: 0.999
+adam_eps: 1.0e-8

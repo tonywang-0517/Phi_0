@@ -26,6 +26,10 @@ save_action_expert_only: true
 save_optimizer: false  # only needed to resume training with exact Adam state
 mixed_precision: bf16
 device: cuda
+# Multi-GPU: launch with torchrun (see scripts/run_libero_delta_train_ddp.sh).
+# batch_size is per-GPU, same convention as VLA-Adapter finetune.py.
+distributed: false
+ddp_find_unused_parameters: false
 smoke_action_only: false
 
 data:

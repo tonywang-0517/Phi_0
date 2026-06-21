@@ -33,16 +33,18 @@ def test_compute_action_stats_masked_dims():
     assert stats["mean"][0] == pytest.approx(1.5, abs=1e-5)
     assert stats["mean"][3] == pytest.approx(2.5, abs=1e-5)
     assert stats["std"][0] == pytest.approx(0.5, abs=1e-5)
-    assert stats["count_per_dim"][100] == 0
+    assert stats["supervised_mask"][100] is False
     assert stats["mean"][100] == pytest.approx(0.0, abs=1e-6)
     assert stats["std"][100] == pytest.approx(1.0, abs=1e-6)
 
 
 def test_stats_to_tensors():
     stats = {"mean": [0.0] * D_RAW, "std": [2.0] * D_RAW}
-    mean, std = stats_to_tensors(stats)
+    mean, std, q01, q99 = stats_to_tensors(stats)
     assert mean.shape == (D_RAW,)
     assert std[0].item() == pytest.approx(2.0)
+    assert q01.shape == (D_RAW,)
+    assert q99.shape == (D_RAW,)
 
 
 @pytest.mark.skipif(

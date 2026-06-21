@@ -13,6 +13,12 @@ def test_dit4dit_resize_480x640_to_224():
     assert out.shape == (1, 5, 3, 224, 224)
 
 
+def test_dit4dit_skip_noop_resize():
+    pixel = torch.rand(1, 5, 3, 224, 224)
+    out = dit4dit_preprocess_video(pixel, size=(224, 224))
+    assert out is pixel
+
+
 def test_dit4dit_crop_scale_then_resize():
     pixel = torch.rand(2, 3, 3, 480, 640)
     out = dit4dit_preprocess_video(pixel, size=(224, 224), crop_scale=0.95)

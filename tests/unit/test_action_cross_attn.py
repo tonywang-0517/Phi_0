@@ -11,32 +11,39 @@ from phi0.models.vggt.tower import VGGT_REGISTER_DIM
 
 
 def test_resolve_modes():
-    assert resolve_action_cross_attn_mode("interleave_cosmos") == "interleave_cosmos"
-    assert resolve_action_cross_attn_mode("dual_cosmos_vggt") == "dual_cosmos_vggt"
-    assert resolve_action_cross_attn_mode("all_cosmos") == "all_cosmos"
-    assert resolve_action_cross_attn_mode(None, interleave_self_attention=False) == "all_cosmos"
-    assert resolve_action_cross_attn_mode(None, interleave_self_attention=True) == "interleave_cosmos"
+    assert resolve_action_cross_attn_mode("interleave_vlm") == "interleave_vlm"
+    assert resolve_action_cross_attn_mode("dual_vlm_vggt") == "dual_vlm_vggt"
+    assert resolve_action_cross_attn_mode("all_vlm") == "all_vlm"
+    assert resolve_action_cross_attn_mode("self_only") == "self_only"
+    assert resolve_action_cross_attn_mode("dual_cosmos_vggt") == "dual_vlm_vggt"
+    assert resolve_action_cross_attn_mode(None, interleave_self_attention=False) == "all_vlm"
+    assert resolve_action_cross_attn_mode(None, interleave_self_attention=True) == "interleave_vlm"
 
 
 def test_cross_attn_targets_interleave():
-    assert cross_attn_target("interleave_cosmos", 0) == "cosmos"
-    assert cross_attn_target("interleave_cosmos", 1) is None
-    assert cross_attn_target("interleave_cosmos", 2) == "cosmos"
+    assert cross_attn_target("interleave_vlm", 0) == "vlm"
+    assert cross_attn_target("interleave_vlm", 1) is None
+    assert cross_attn_target("interleave_vlm", 2) == "vlm"
 
 
 def test_cross_attn_targets_dual():
-    assert cross_attn_target("dual_cosmos_vggt", 0) == "cosmos"
-    assert cross_attn_target("dual_cosmos_vggt", 1) == "vggt"
-    assert cross_attn_target("dual_cosmos_vggt", 2) == "cosmos"
-    assert cross_attn_target("dual_cosmos_vggt", 3) == "vggt"
+    assert cross_attn_target("dual_vlm_vggt", 0) == "vlm"
+    assert cross_attn_target("dual_vlm_vggt", 1) == "vggt"
+    assert cross_attn_target("dual_vlm_vggt", 2) == "vlm"
+    assert cross_attn_target("dual_vlm_vggt", 3) == "vggt"
 
 
-def test_cross_attn_targets_all_cosmos():
+def test_cross_attn_targets_all_vlm():
     for i in range(4):
-        assert cross_attn_target("all_cosmos", i) == "cosmos"
+        assert cross_attn_target("all_vlm", i) == "vlm"
 
 
-@pytest.mark.parametrize("mode", ["interleave_cosmos", "dual_cosmos_vggt", "all_cosmos"])
+def test_cross_attn_targets_self_only():
+    for i in range(6):
+        assert cross_attn_target("self_only", i) is None
+
+
+@pytest.mark.parametrize("mode", ["interleave_vlm", "dual_vlm_vggt", "all_vlm", "self_only"])
 def test_action_fm_dit_forward_shapes(mode: str):
     b, t_act, s_c, s_v = 2, 8, 32, 16
     hidden = 256
@@ -57,13 +64,13 @@ def test_action_fm_dit_forward_shapes(mode: str):
     )
     action = torch.randn(b, t_act, 256)
     timestep = torch.randint(0, 1000, (b,))
-    cosmos_ctx = torch.randn(b, s_c, 512)
-    vggt_ctx = torch.randn(b, s_v, VGGT_REGISTER_DIM) if mode == "dual_cosmos_vggt" else None
+    vlm_ctx = torch.randn(b, s_c, 512)
+    vggt_ctx = torch.randn(b, s_v, VGGT_REGISTER_DIM) if mode == "dual_vlm_vggt" else None
 
     out = model(
         action,
         timestep,
-        cosmos_ctx,
+        vlm_ctx,
         vggt_context=vggt_ctx,
     )
     assert out.shape == (b, t_act, 256)
@@ -80,7 +87,7 @@ def test_dual_mode_requires_vggt():
         num_heads=4,
         attn_head_dim=64,
         num_layers=2,
-        action_cross_attn_mode="dual_cosmos_vggt",
+        action_cross_attn_mode="dual_vlm_vggt",
     )
     with pytest.raises(ValueError, match="vggt_context"):
         model(

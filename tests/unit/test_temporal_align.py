@@ -106,6 +106,26 @@ def test_video_cond_pixel_frames_legacy():
     assert video_sample_control_indices(3, 0) == [0, 1, 2]
 
 
+def test_observation_subsampled_frame_index_past_w1():
+    from phi0.data.temporal_align import (
+        observation_subsampled_frame_index,
+        proprio_current_control_step,
+    )
+
+    subsampled = video_sample_control_indices(9, 2)
+    assert proprio_current_control_step(1) == 0
+    assert observation_subsampled_frame_index(1, subsampled) == 0
+    assert subsampled[0] == 0
+
+
+def test_observation_subsampled_frame_index_past_w5():
+    from phi0.data.temporal_align import observation_subsampled_frame_index
+
+    subsampled = video_sample_control_indices(13, 2)
+    assert observation_subsampled_frame_index(5, subsampled) == 2
+    assert subsampled[2] == 4
+
+
 def test_resample_action_sequence_identity():
     src = torch.arange(12, dtype=torch.float32).reshape(4, 3)
     out = resample_action_sequence(src, 4, 4)

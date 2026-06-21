@@ -53,7 +53,7 @@ def test_refresh_video_updates_context():
 
     img1 = torch.rand(1, 3, 480, 640) * 2.0 - 1.0
     clip1 = img1.unsqueeze(2).expand(1, 3, 29, 480, 640)
-    session.refresh_video_context_from_clip(clip1)
+    session.refresh_video_context_from_clip(clip1, prompt="pick up cup")
     assert session.video_refresh_count == 2
     assert session._video_clip is not None
     assert session._video_clip.shape[2] == 29

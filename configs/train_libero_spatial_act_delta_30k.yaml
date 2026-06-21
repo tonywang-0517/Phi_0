@@ -1,0 +1,13 @@
+# @package _global_
+# ACT + absolute-EEF proprio prefix + 8-step delta EEF chunk — 30k steps.
+
+defaults:
+  - train_libero_spatial_act_delta_300
+  - _self_
+
+output_dir: ./experiments/libero_spatial_act_delta_8_30k
+checkpoint_name: libero_spatial_act_delta_8_30k
+max_steps: 30000
+save_every_steps: 2000
+checkpoint_overwrite: true
+auto_resume: true

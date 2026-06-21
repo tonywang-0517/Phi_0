@@ -1,0 +1,33 @@
+# @package _global_
+# Ablation: ACT head only — no VLM tower, no cross-attention (self_only DiT).
+# Hyperparams match train_libero_spatial_act_delta_15k_single for fair comparison.
+
+defaults:
+  - train_libero_spatial_act_delta_15k_single
+  - override /model: phi0_full
+  - _self_
+
+output_dir: ./experiments/libero_spatial_action_only_15k_single
+checkpoint_name: libero_spatial_action_only_15k_single
+
+model:
+  robot_action_dim: 7
+  robot_action_loss_type: l1
+  prompt_max_length: 1536
+  action_head: act
+  past_action_window_size: 1
+  vlm:
+    enabled: false
+  vggt:
+    enabled: false
+  action_dit_config:
+    action_cross_attn_mode: self_only
+    use_gradient_checkpointing: false
+    text_dim: 2048
+  loss:
+    lambda_video: 0.0
+    lambda_action: 1.0
+    lambda_bone: 0.0
+    lambda_bone_hand: 0.0
+    lambda_bone_dir: 0.0
+    lambda_hand_mse: 0.0

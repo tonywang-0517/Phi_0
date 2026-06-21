@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from typing import Any, Mapping, Tuple
 
-# Cosmos Predict2.5 robot post-train tier (landscape 16:9).
+# Cosmos Predict2.5 robot 720-tier (704×1280 landscape; official post-train resolution).
 DEFAULT_COSMOS_VIDEO_SIZE: Tuple[int, int] = (704, 1280)
 
 

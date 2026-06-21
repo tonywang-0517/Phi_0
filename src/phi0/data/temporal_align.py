@@ -47,6 +47,161 @@ def video_sample_control_indices(seq_len: int, action_video_freq_ratio: int) -> 
     return list(range(0, int(seq_len), ratio))
 
 
+def v2w_cond_control_span_steps(
+    cond_pixel_frames: int = 5,
+    action_video_freq_ratio: int = 2,
+) -> int:
+    """Control-step span covered by ``cond_pixel_frames`` subsampled frames (inclusive endpoints)."""
+    ratio = max(1, int(action_video_freq_ratio))
+    cond_px = max(1, int(cond_pixel_frames))
+    return (cond_px - 1) * ratio
+
+
+def deploy_v2w_cond_video_control_indices(
+    current_step: int,
+    *,
+    cond_pixel_frames: int = 5,
+    action_video_freq_ratio: int = 2,
+) -> List[int]:
+    """Official V2W cond window: ``cond_pixel_frames`` subsampled indices ending at ``current_step``."""
+    ratio = max(1, int(action_video_freq_ratio))
+    cond_px = max(1, int(cond_pixel_frames))
+    span = v2w_cond_control_span_steps(cond_px, ratio)
+    clip_start = max(0, int(current_step) - span)
+    rel_len = int(current_step) - clip_start + 1
+    rel = video_sample_control_indices(rel_len, ratio)
+    # Always include the live frame at ``current_step`` (may fall off the ratio grid).
+    last_rel = rel_len - 1
+    if not rel or rel[-1] != last_rel:
+        rel = sorted(set(rel + [last_rel]))
+    if len(rel) > cond_px:
+        rel = rel[-cond_px:]
+    if len(rel) < cond_px:
+        rel = [rel[0]] * (cond_px - len(rel)) + rel
+    return [clip_start + int(i) for i in rel]
+
+
+def proprio_current_control_step(past_action_window_size: int) -> int:
+    """Inclusive control index of the proprio-prefix 'current' frame within a training clip."""
+    w = int(past_action_window_size)
+    if w <= 0:
+        raise ValueError(f"past_action_window_size must be positive, got {w}")
+    return w - 1
+
+
+def observation_subsampled_frame_index(
+    past_action_window_size: int,
+    subsampled_control_indices: Sequence[int],
+) -> int:
+    """Index into subsampled pixel ``[B,T,C,H,W]`` aligned with proprio current step."""
+    if not subsampled_control_indices:
+        raise ValueError("subsampled_control_indices must be non-empty")
+    anchor = proprio_current_control_step(past_action_window_size)
+    return int(
+        subsampled_positions_for_control_indices(
+            [anchor], subsampled_control_indices
+        )[0]
+    )
+
+
+def training_v2w_cond_control_indices(
+    *,
+    past_action_window_size: int,
+    action_video_freq_ratio: int = 2,
+    cond_pixel_frames: int = 5,
+) -> List[int]:
+    """V2W cond indices ending at proprio current — same rule as deploy ``past_only``."""
+    current = proprio_current_control_step(past_action_window_size)
+    return deploy_v2w_cond_video_control_indices(
+        current,
+        action_video_freq_ratio=action_video_freq_ratio,
+        cond_pixel_frames=cond_pixel_frames,
+    )
+
+
+def subsampled_positions_for_control_indices(
+    control_indices: Sequence[int],
+    subsampled_control_indices: Sequence[int],
+) -> List[int]:
+    """Map control timeline indices to positions along a subsampled video tensor (T axis)."""
+    pos = {int(c): i for i, c in enumerate(subsampled_control_indices)}
+    subs = [int(c) for c in subsampled_control_indices]
+    if not subs:
+        raise ValueError("subsampled_control_indices must be non-empty")
+    out: List[int] = []
+    for c in control_indices:
+        c = int(c)
+        if c in pos:
+            out.append(pos[c])
+            continue
+        prior = [x for x in subs if x <= c]
+        key = max(prior) if prior else subs[0]
+        out.append(pos[key])
+    return out
+
+
+def gather_subsampled_video_bcthw(
+    video_bcthw: torch.Tensor,
+    tensor_indices: Sequence[int],
+) -> torch.Tensor:
+    """Gather ``[B,3,T,H,W]`` along T using subsampled positions."""
+    if video_bcthw.ndim != 5:
+        raise ValueError(f"video must be [B,3,T,H,W], got {tuple(video_bcthw.shape)}")
+    idx = torch.tensor(list(tensor_indices), device=video_bcthw.device, dtype=torch.long)
+    return video_bcthw.index_select(2, idx).contiguous()
+
+
+def gather_subsampled_pad_mask(
+    pad_bt: torch.Tensor,
+    tensor_indices: Sequence[int],
+) -> torch.Tensor:
+    """Gather per-frame pad flags ``[B,T]`` along T."""
+    if pad_bt.ndim != 2:
+        raise ValueError(f"pad must be [B,T], got {tuple(pad_bt.shape)}")
+    idx = torch.tensor(list(tensor_indices), device=pad_bt.device, dtype=torch.long)
+    return pad_bt.index_select(1, idx).contiguous()
+
+
+def select_proprio_aligned_tower_video(
+    video_bcthw: torch.Tensor,
+    *,
+    seq_len: int,
+    past_action_window_size: int,
+    action_video_freq_ratio: int = 2,
+    cond_pixel_frames: int = 5,
+) -> tuple[torch.Tensor, List[int]]:
+    """Proprio-aligned V2W window from a full subsampled training clip (matches deploy)."""
+    subsampled = video_sample_control_indices(int(seq_len), int(action_video_freq_ratio))
+    cond_ctrl = training_v2w_cond_control_indices(
+        past_action_window_size=past_action_window_size,
+        action_video_freq_ratio=action_video_freq_ratio,
+        cond_pixel_frames=cond_pixel_frames,
+    )
+    t_idx = subsampled_positions_for_control_indices(cond_ctrl, subsampled)
+    return gather_subsampled_video_bcthw(video_bcthw, t_idx), cond_ctrl
+
+
+def video_history_control_span_steps(control_fps: float, video_history_seconds: float) -> int:
+    """Control-step delta covering ``video_history_seconds`` (e.g. 20 Hz × 1 s → 20)."""
+    if control_fps <= 0 or video_history_seconds <= 0:
+        raise ValueError(
+            f"control_fps and video_history_seconds must be positive, "
+            f"got control_fps={control_fps} video_history_seconds={video_history_seconds}"
+        )
+    return max(1, int(round(float(control_fps) * float(video_history_seconds))))
+
+
+def min_seq_len_for_video_history(
+    control_fps: float,
+    video_history_seconds: float,
+    *,
+    min_action_steps: int = 1,
+) -> int:
+    """Minimum ``seq_len`` so a training clip spans at least ``video_history_seconds``."""
+    span = video_history_control_span_steps(control_fps, video_history_seconds)
+    return max(int(min_action_steps), span + 1)
+
+
 def dit4dit_train_num_frames_out(seq_len: int, action_video_freq_ratio: int) -> int:
     """Training / eval pixel frame count (DiT4DiT ``train_num_frames_out`` formula)."""
     return len(video_sample_control_indices(seq_len, action_video_freq_ratio))
