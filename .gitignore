@@ -44,3 +44,8 @@ __pycache__/
 # IDE
 .vscode/
 .idea/
+.cursor/
+
+# Vendored sim / benchmark deps (install via scripts/setup_benchmark_data.sh)
+third_party/
+*.zip
