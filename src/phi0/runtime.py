@@ -10,6 +10,7 @@ import torch
 from omegaconf import DictConfig, OmegaConf
 from torch.utils.data import DataLoader
 
+from phi0.data.dataloader_policy import log_dataloader_settings, resolve_dataloader_settings
 from phi0.data.libero_rlds import LiberoRldsFrameDataset
 from phi0.data.processor import Phi0MixedDataset, Phi0Processor, build_overfit_datasets
 from phi0.data.sequence import SequenceDataset, sequence_dataset_from_cfg
@@ -381,11 +382,18 @@ def _log_trainable_scope(model: Phi0) -> None:
     )
 
 
-def build_base_dataset(cfg: DictConfig):
+def build_base_dataset(
+    cfg: DictConfig,
+    *,
+    dist_ctx=None,
+    loader_settings=None,
+):
     """Frame-level dataset before SequenceDataset clipping."""
     data_cfg = cfg.data
     dataset_name = str(data_cfg.get("dataset", "xperience")).strip().lower()
     if dataset_name in {"libero_spatial", "libero", "libero_rlds"}:
+        if loader_settings is None:
+            loader_settings = resolve_dataloader_settings(cfg, dist_ctx=dist_ctx)
         suite = str(data_cfg.get("libero_suite", "libero_spatial"))
         max_eps = data_cfg.get("libero_max_episodes")
         max_shards = data_cfg.get("libero_max_shards")
@@ -397,7 +405,8 @@ def build_base_dataset(cfg: DictConfig):
             max_shards=int(max_shards) if max_shards is not None else None,
             libero_delta_eef=bool(data_cfg.get("libero_delta_eef", True)),
             defer_cosmos_resize=True,
-            cache_native_frames=bool(data_cfg.get("libero_cache_native_frames", True)),
+            cache_native_frames=loader_settings.cache_native_frames,
+            mono_camera=bool(data_cfg.get("mono_camera", True)),
         )
 
     video_path = data_cfg.get("xperience_video")
@@ -414,9 +423,11 @@ def build_base_dataset(cfg: DictConfig):
 
 def build_dataloader(cfg: DictConfig, *, dist_ctx=None) -> DataLoader:
     data_cfg = cfg.data
-    base = build_base_dataset(cfg)
+    loader_settings = resolve_dataloader_settings(cfg, dist_ctx=dist_ctx)
+    log_dataloader_settings(loader_settings, logger=logger, dist_ctx=dist_ctx)
+    base = build_base_dataset(cfg, dist_ctx=dist_ctx, loader_settings=loader_settings)
     seq = sequence_dataset_from_cfg(base, data_cfg)
-    num_workers = int(cfg.get("num_workers", 0))
+    num_workers = loader_settings.num_workers
     use_cuda = str(cfg.get("device", "cuda")).startswith("cuda") and torch.cuda.is_available()
     loader_kwargs: Dict[str, Any] = {
         "batch_size": int(cfg.batch_size),
@@ -441,7 +452,7 @@ def build_dataloader(cfg: DictConfig, *, dist_ctx=None) -> DataLoader:
             loader_kwargs["drop_last"] = True
     if num_workers > 0:
         loader_kwargs["persistent_workers"] = True
-        loader_kwargs["prefetch_factor"] = int(cfg.get("prefetch_factor", 2))
+        loader_kwargs["prefetch_factor"] = loader_settings.prefetch_factor
     return DataLoader(seq, **loader_kwargs)
 
 
@@ -514,6 +525,7 @@ def build_processor(cfg: DictConfig, *, dist_ctx=None) -> Phi0Processor:
         normalize=bool(data_cfg.get("normalize", True)),
         vlm_image_size=(int(vlm_size[0]), int(vlm_size[1])),
         vlm_img_aug=bool(vlm_cfg.get("img_aug", False)),
+        use_wrist_view=not bool(data_cfg.get("mono_camera", True)),
     )
     if not processor.normalize:
         return processor.train()
@@ -656,10 +668,20 @@ def prepare_model_batch_cpu(
         return payload
 
     pixel = sample["pixel_values"]
+    wrist_pixel = None
     if pixel.ndim == 6:
+        if processor.use_wrist_view:
+            if pixel.shape[1] < 2:
+                raise ValueError(
+                    f"use_wrist_view=True but pixel_values has shape {tuple(pixel.shape)}"
+                )
+            wrist_pixel = pixel[:, 1]
         pixel = pixel[:, 0]
     frame_idx = _resolve_observation_frame_index(model, pixel, batch)
     obs_pixel = pixel[:, frame_idx : frame_idx + 1]
+    obs_wrist_pixel = None
+    if wrist_pixel is not None:
+        obs_wrist_pixel = wrist_pixel[:, frame_idx : frame_idx + 1]
 
     processor_obj = getattr(model.vlm_tower, "processor", None)
     if processor_obj is None:
@@ -670,6 +692,7 @@ def prepare_model_batch_cpu(
         obs_pixel,
         sample["instruction"],
         model_max_length=int(getattr(model, "prompt_max_length", 512)),
+        wrist_pixel=obs_wrist_pixel,
     )
 
     payload.update(
@@ -794,6 +817,7 @@ def prepare_model_batch_gpu(
                         out["attention_mask"],
                         out["pixel_values"],
                         out["image_grid_thw"],
+                        out.get("mm_token_type_ids"),
                     )
             else:
                 action_ctx, action_ctx_mask = model.vlm_tower.extract_action_context(
@@ -801,6 +825,7 @@ def prepare_model_batch_gpu(
                     out["attention_mask"],
                     out["pixel_values"],
                     out["image_grid_thw"],
+                    out.get("mm_token_type_ids"),
                 )
             out["action_ctx"] = action_ctx.detach()
             out["action_ctx_mask"] = action_ctx_mask.detach()

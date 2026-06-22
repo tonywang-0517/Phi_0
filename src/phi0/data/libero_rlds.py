@@ -15,7 +15,7 @@ from phi0.benchmark.rlds_adapters import (
     libero_rlds_action_to_train,
     libero_rlds_state_to_eef_7d,
 )
-from phi0.benchmark.rlds_io import RldsEpisode, iter_rlds_shards, libero_train_shard_glob
+from phi0.benchmark.rlds_io import RldsEpisode, RldsStep, iter_rlds_shards, libero_train_shard_glob
 from phi0.schema.draw_schema import D_RAW
 
 ROBOT_ACTION_DIM = 7  # VLA-Adapter LIBERO_CONSTANTS["ACTION_DIM"]
@@ -32,11 +32,19 @@ def _libero_dim_pad() -> torch.Tensor:
     return torch.zeros(D_RAW, dtype=torch.bool)
 
 
+def _native_chw_u8(img: np.ndarray) -> torch.Tensor:
+    """uint8 HWC -> uint8 CHW (compact cache; convert to float in __getitem__)."""
+    arr = np.array(img, dtype=np.uint8, copy=True)
+    return torch.from_numpy(arr).permute(2, 0, 1).contiguous()
+
+
+def _chw_u8_to_batch_f32(t: torch.Tensor) -> torch.Tensor:
+    return t.float().div(255.0).unsqueeze(0)
+
+
 def _native_chw_f32(img: np.ndarray) -> torch.Tensor:
     """uint8 HWC -> float CHW in [0,1] at native resolution (no resize)."""
-    arr = np.array(img, dtype=np.uint8, copy=True)
-    t = torch.from_numpy(arr).permute(2, 0, 1).float().div(255.0)
-    return t.unsqueeze(0)
+    return _chw_u8_to_batch_f32(_native_chw_u8(img))
 
 
 def _resize_chw(img: np.ndarray, size: tuple[int, int]) -> torch.Tensor:
@@ -44,8 +52,7 @@ def _resize_chw(img: np.ndarray, size: tuple[int, int]) -> torch.Tensor:
 
     RLDS JPEGs are already 180°-rotated in the OpenVLA conversion; do not flip here.
     """
-    arr = np.array(img, dtype=np.uint8, copy=True)
-    t = torch.from_numpy(arr).permute(2, 0, 1).float() / 255.0
+    t = _native_chw_u8(img).float().div(255.0)
     t = F.interpolate(t.unsqueeze(0), size=size, mode="bilinear", align_corners=False).squeeze(0)
     return t.unsqueeze(0)
 
@@ -66,10 +73,12 @@ class LiberoRldsFrameDataset(Dataset):
         libero_delta_eef: bool = True,
         defer_cosmos_resize: bool = False,
         cache_native_frames: bool = False,
+        mono_camera: bool = True,
     ) -> None:
         self.libero_delta_eef = bool(libero_delta_eef)
         self.defer_cosmos_resize = bool(defer_cosmos_resize)
         self.cache_native_frames = bool(cache_native_frames)
+        self.mono_camera = bool(mono_camera)
         self.suite = str(suite).replace("_no_noops", "")
         self.DATASET_NAME = self.suite
         self.image_size = (int(image_size[0]), int(image_size[1]))
@@ -99,18 +108,53 @@ class LiberoRldsFrameDataset(Dataset):
                 self._frame_index.append((ep_i, step_i))
 
         self._native_image_cache: list[torch.Tensor] | None = None
+        self._native_wrist_cache: list[torch.Tensor] | None = None
         if self.cache_native_frames:
             self._native_image_cache = [
-                _native_chw_f32(self._episodes[ep_i].steps[step_i].rgb_static)[0]
+                _native_chw_u8(self._episodes[ep_i].steps[step_i].rgb_static)
                 for ep_i, step_i in self._frame_index
             ]
+            if not self.mono_camera:
+                self._native_wrist_cache = [
+                    _native_chw_u8(self._episodes[ep_i].steps[step_i].rgb_gripper)
+                    for ep_i, step_i in self._frame_index
+                ]
+            self._strip_episode_images()
 
-    def _frame_image(self, idx: int, rgb_static: np.ndarray) -> torch.Tensor:
-        if self._native_image_cache is not None:
-            return self._native_image_cache[idx].unsqueeze(0)
+    def _strip_episode_images(self) -> None:
+        """Drop decoded RGB from episodes; cached uint8 tensors serve __getitem__."""
+        self._episodes = [
+            RldsEpisode(
+                steps=[
+                    RldsStep(
+                        rgb_static=None,
+                        rgb_gripper=None,
+                        state=s.state,
+                        action=s.action,
+                        language=s.language,
+                    )
+                    for s in ep.steps
+                ],
+                episode_id=ep.episode_id,
+            )
+            for ep in self._episodes
+        ]
+
+    def _frame_image(
+        self,
+        idx: int,
+        rgb: np.ndarray | None,
+        *,
+        wrist: bool = False,
+    ) -> torch.Tensor:
+        cache = self._native_wrist_cache if wrist else self._native_image_cache
+        if cache is not None:
+            return _chw_u8_to_batch_f32(cache[idx])
+        if rgb is None:
+            raise RuntimeError("Missing RGB frame and native-frame cache is disabled.")
         if self.defer_cosmos_resize:
-            return _native_chw_f32(rgb_static)
-        return _resize_chw(rgb_static, self.image_size)
+            return _native_chw_f32(rgb)
+        return _resize_chw(rgb, self.image_size)
 
     def __len__(self) -> int:
         return len(self._frame_index)
@@ -127,6 +171,10 @@ class LiberoRldsFrameDataset(Dataset):
             "action_dim_is_pad": _libero_dim_pad(),
             "images": {"ego_view": self._frame_image(idx, step.rgb_static)},
         }
+        if not self.mono_camera:
+            out["images"]["wrist_view"] = self._frame_image(
+                idx, step.rgb_gripper, wrist=True
+            )
         if self.libero_delta_eef:
             delta_7d = libero_rlds_action_to_train(step.action)
             out["robot_proprio_7d"] = _robot_action_7d_tensor(proprio_7d)

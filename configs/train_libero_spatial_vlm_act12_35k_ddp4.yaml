@@ -1,0 +1,19 @@
+# @package _global_
+# Ablation D: frozen VLM + ACT head with 2x blocks (12 layers), mono camera, 4-GPU DDP, 35k steps.
+
+defaults:
+  - train_libero_spatial_vlm_only_35k_ddp4
+  - _self_
+
+output_dir: ./experiments/libero_spatial_vlm_act12_35k_ddp4
+checkpoint_name: libero_spatial_vlm_act12_35k_ddp4
+
+# 12 layers vs baseline 6: scale lr linearly by depth (1e-4 * 6/12).
+learning_rate_action: 5.0e-5
+learning_rate_warmup_steps: 1000
+learning_rate_scheduler: cosine
+lr_scale: none
+
+model:
+  action_dit_config:
+    num_layers: 12

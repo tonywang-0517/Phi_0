@@ -18,10 +18,13 @@ distributed: true
 ddp_drop_last: true
 ddp_find_unused_parameters: true
 
-num_workers: 8
-prefetch_factor: 4
-train_cpu_prefetch: 4
+num_workers: 2
+prefetch_factor: 2
+train_cpu_prefetch: 2
 train_gpu_pipeline: true
+# Cap total dataset replicas (rank + workers) to avoid multi-TiB RAM on large DDP jobs.
+dataloader_max_dataset_copies: 24
+dataloader_max_workers_per_rank: 2
 compile_action_expert: false
 
 lr_scale: none

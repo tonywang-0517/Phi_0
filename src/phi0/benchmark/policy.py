@@ -113,6 +113,7 @@ class Phi0VLAPolicy:
             deploy_seq_len=int(train_cfg.data.get("seq_len", 33)),
             action_video_freq_ratio=int(train_cfg.data.get("action_video_freq_ratio", 2)),
             use_gt_proprio=libero_flags.proprio_absolute,
+            use_wrist_view=bool(processor.use_wrist_view),
         )
         self.projector = KeypointToArmActionProjector(cfg.projection)
         self.bridge_input_mode = str(cfg.bridge_input_mode).strip().lower()
@@ -138,6 +139,8 @@ class Phi0VLAPolicy:
         self._control_fps = float(train_cfg.data.get("control_fps", 20.0))
         self._past_window = int(getattr(model, "past_action_window_size", 1))
         self._frame_buffer: dict[int, torch.Tensor] = {}
+        self._wrist_frame_buffer: dict[int, torch.Tensor] = {}
+        self.use_wrist_view = bool(processor.use_wrist_view)
         self._libero_flags = libero_flags
         self._libero_delta_eef = libero_flags.delta_eef
         self._libero_proprio_absolute = libero_flags.proprio_absolute
@@ -175,6 +178,7 @@ class Phi0VLAPolicy:
         self.session.reset()
         self.projector.reset()
         self._frame_buffer.clear()
+        self._wrist_frame_buffer.clear()
 
     def _ensure_proprio_seeded(self) -> None:
         w = int(getattr(self.model, "past_action_window_size", 0) or 0)
@@ -220,10 +224,16 @@ class Phi0VLAPolicy:
             from phi0.benchmark.adapters import libero_obs_to_native_frame
 
             frame = libero_obs_to_native_frame(obs)
+            self._frame_buffer[int(step)] = frame.detach()
+            if self.use_wrist_view:
+                wrist = libero_obs_to_native_frame(
+                    obs, camera="robot0_eye_in_hand_image"
+                )
+                self._wrist_frame_buffer[int(step)] = wrist.detach()
         else:
             vla_obs = self._obs_to_vla(obs, benchmark=benchmark)
             frame = torch.from_numpy(vla_obs.full_image).permute(2, 0, 1).float() / 255.0
-        self._frame_buffer[int(step)] = frame.detach()
+            self._frame_buffer[int(step)] = frame.detach()
 
     def _read_buffered_frame(self, control_t: int) -> torch.Tensor:
         if control_t in self._frame_buffer:
@@ -235,8 +245,23 @@ class Phi0VLAPolicy:
             return self._frame_buffer[max(prior)]
         return self._frame_buffer[min(self._frame_buffer)]
 
+    def _read_buffered_wrist_frame(self, control_t: int) -> torch.Tensor:
+        if control_t in self._wrist_frame_buffer:
+            return self._wrist_frame_buffer[control_t]
+        if not self._wrist_frame_buffer:
+            raise RuntimeError("Wrist frame buffer is empty; call _store_control_frame first.")
+        prior = [k for k in self._wrist_frame_buffer if k <= control_t]
+        if prior:
+            return self._wrist_frame_buffer[max(prior)]
+        return self._wrist_frame_buffer[min(self._wrist_frame_buffer)]
+
     def _current_frame_bcthw(self, step: int) -> torch.Tensor:
         frame = self._read_buffered_frame(int(step))
+        clip = frame.unsqueeze(0).unsqueeze(2)
+        return clip.to(device=self.model.device, dtype=self.model.torch_dtype) * 2.0 - 1.0
+
+    def _current_wrist_frame_bcthw(self, step: int) -> torch.Tensor:
+        frame = self._read_buffered_wrist_frame(int(step))
         clip = frame.unsqueeze(0).unsqueeze(2)
         return clip.to(device=self.model.device, dtype=self.model.torch_dtype) * 2.0 - 1.0
 
@@ -261,14 +286,22 @@ class Phi0VLAPolicy:
         if bench == "libero":
             prompt = normalize_vlm_instruction(instruction)
             clip = self._current_frame_bcthw(step)
+            wrist_clip = self._current_wrist_frame_bcthw(step) if self.use_wrist_view else None
             vggt_clip = clip if self.model.uses_dual_vggt_cross_attn() else None
             if self.session.action_ctx is None:
                 self.session.prefill_from_video_clip(
-                    clip, prompt, prompt_cache=self.prompt_cache, vggt_video=vggt_clip
+                    clip,
+                    prompt,
+                    prompt_cache=self.prompt_cache,
+                    vggt_video=vggt_clip,
+                    wrist_video=wrist_clip,
                 )
             else:
                 self.session.refresh_video_context_from_clip(
-                    clip, prompt=prompt, vggt_video=vggt_clip
+                    clip,
+                    prompt=prompt,
+                    vggt_video=vggt_clip,
+                    wrist_video=wrist_clip,
                 )
             return self.session.predict(self.default_open_loop)
 

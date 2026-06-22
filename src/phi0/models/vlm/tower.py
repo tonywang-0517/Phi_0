@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import logging
 from pathlib import Path
-from typing import Optional, Tuple
+from typing import Any, Dict, Optional, Tuple
 
 import torch
 import torch.nn as nn
@@ -124,30 +124,36 @@ class Qwen3VLTower(nn.Module):
         attention_mask: torch.Tensor,
         pixel_values: torch.Tensor,
         image_grid_thw: torch.Tensor,
+        mm_token_type_ids: torch.Tensor | None = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """Return VLM hidden states ``[B,S,D]`` and bool mask ``[B,S]``."""
         input_ids = input_ids.to(device=self.device, non_blocking=True)
         attention_mask = attention_mask.to(device=self.device, non_blocking=True)
         pixel_values = pixel_values.to(device=self.device, non_blocking=True)
         image_grid_thw = image_grid_thw.to(device=self.device, non_blocking=True)
+        if mm_token_type_ids is not None:
+            mm_token_type_ids = mm_token_type_ids.to(device=self.device, non_blocking=True)
 
         amp_enabled = self.device.type == "cuda" and self.torch_dtype in {
             torch.float16,
             torch.bfloat16,
         }
+        model_kwargs: Dict[str, Any] = {
+            "input_ids": input_ids,
+            "attention_mask": attention_mask,
+            "pixel_values": pixel_values,
+            "image_grid_thw": image_grid_thw,
+            "output_hidden_states": True,
+            "return_dict": True,
+        }
+        if mm_token_type_ids is not None:
+            model_kwargs["mm_token_type_ids"] = mm_token_type_ids
         with torch.autocast(
             device_type=self.device.type,
             dtype=self.torch_dtype,
             enabled=amp_enabled,
         ):
-            output = self.vlm_model(
-                input_ids=input_ids,
-                attention_mask=attention_mask,
-                pixel_values=pixel_values,
-                image_grid_thw=image_grid_thw,
-                output_hidden_states=True,
-                return_dict=True,
-            )
+            output = self.vlm_model(**model_kwargs)
         hidden = output.hidden_states[-1]
         ctx_mask = attention_mask.to(dtype=torch.bool)
         return hidden, ctx_mask
@@ -181,11 +187,12 @@ class SmokeVLMTower(nn.Module):
         attention_mask: torch.Tensor,
         pixel_values: torch.Tensor,
         image_grid_thw: torch.Tensor,
+        mm_token_type_ids: torch.Tensor | None = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         batch = int(input_ids.shape[0])
         seq = int(attention_mask.shape[1]) if attention_mask.ndim == 2 else self.num_context_tokens
         bias = float(pixel_values.float().mean()) if torch.is_tensor(pixel_values) else 0.0
-        del image_grid_thw
+        del image_grid_thw, mm_token_type_ids
         hidden = torch.full(
             (batch, seq, self.action_context_dim),
             bias,

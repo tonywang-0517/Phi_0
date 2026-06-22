@@ -171,10 +171,20 @@ class SequenceDataset(Dataset):
             images_out = torch.stack(
                 [native_frames[i]["images"]["ego_view"][0] for i in video_idx]
             )
+            wrist_out = None
+            if "wrist_view" in native_frames[0]["images"]:
+                wrist_out = torch.stack(
+                    [native_frames[i]["images"]["wrist_view"][0] for i in video_idx]
+                )
         else:
             images = torch.stack([f["images"]["ego_view"][0] for f in native_frames])
             images_ctrl = resample_image_sequence(images, src_len, seq_len_eff)
             images_out = images_ctrl[video_idx]
+            wrist_out = None
+            if "wrist_view" in native_frames[0]["images"]:
+                wrist = torch.stack([f["images"]["wrist_view"][0] for f in native_frames])
+                wrist_ctrl = resample_image_sequence(wrist, src_len, seq_len_eff)
+                wrist_out = wrist_ctrl[video_idx]
         action_ctrl = resample_action_sequence(actions, src_len, seq_len_eff)
         robot_ctrl = None
         if robot_actions is not None:
@@ -205,6 +215,8 @@ class SequenceDataset(Dataset):
             "action_video_freq_ratio": self.action_video_freq_ratio,
             "video_control_indices": video_idx,
         }
+        if wrist_out is not None:
+            out["images"]["wrist_view"] = wrist_out
         if robot_ctrl is not None:
             out["robot_action_7d"] = robot_ctrl
         if proprio_ctrl is not None and delta_ctrl is not None:
@@ -243,6 +255,10 @@ class SequenceDataset(Dataset):
             "action_video_freq_ratio": batch[0].get("action_video_freq_ratio"),
             "video_control_indices": batch[0].get("video_control_indices"),
         }
+        if "wrist_view" in batch[0]["images"]:
+            out["images"]["wrist_view"] = torch.stack(
+                [b["images"]["wrist_view"] for b in batch]
+            )
         if "robot_action_7d" in batch[0]:
             out["robot_action_7d"] = torch.stack([b["robot_action_7d"] for b in batch])
         if "robot_proprio_7d" in batch[0]:

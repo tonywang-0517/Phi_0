@@ -1,0 +1,13 @@
+# @package _global_
+# Ablation C: frozen VLM + ACT head + wrist camera in QwenVL, 4-GPU DDP, 35k steps.
+
+defaults:
+  - train_libero_spatial_vlm_only_35k_ddp4
+  - override /data: libero_spatial_wrist
+  - _self_
+
+output_dir: ./experiments/libero_spatial_vlm_wrist_35k_ddp4
+checkpoint_name: libero_spatial_vlm_wrist_35k_ddp4
+
+model:
+  prompt_max_length: 2048

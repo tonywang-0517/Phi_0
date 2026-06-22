@@ -50,6 +50,7 @@ class VLMContextCache:
                 vlm_inputs["attention_mask"],
                 vlm_inputs["pixel_values"],
                 vlm_inputs["image_grid_thw"],
+                vlm_inputs.get("mm_token_type_ids"),
             )
         if key:
             self._store[key] = (ctx, mask)
@@ -138,10 +139,12 @@ class ActionInferenceSession:
         use_gt_proprio: bool = False,
         use_gt_history: bool | None = None,
         max_rgb_frames: int = 33,
+        use_wrist_view: bool = False,
     ) -> None:
         del max_rgb_frames, action_video_freq_ratio
         self.model = model
         self.processor = processor
+        self.use_wrist_view = bool(use_wrist_view)
         self.deploy_seq_len = int(deploy_seq_len)
         if use_gt_history is not None:
             use_gt_proprio = bool(use_gt_history)
@@ -218,6 +221,8 @@ class ActionInferenceSession:
         self,
         video: torch.Tensor,
         instruction: str,
+        *,
+        wrist_video: torch.Tensor | None = None,
     ) -> Dict[str, torch.Tensor]:
         from phi0.models.vlm.preprocess import (
             build_deploy_vlm_inputs_from_pixels,
@@ -227,6 +232,13 @@ class ActionInferenceSession:
         if video.ndim != 5:
             raise ValueError(f"video must be [B,3,T,H,W], got {tuple(video.shape)}")
         pixel = video_bcthw_to_pixel_batch(video)
+        wrist_pixel = None
+        if wrist_video is not None:
+            if wrist_video.ndim != 5:
+                raise ValueError(
+                    f"wrist_video must be [B,3,T,H,W], got {tuple(wrist_video.shape)}"
+                )
+            wrist_pixel = video_bcthw_to_pixel_batch(wrist_video)
         processor_obj = getattr(self.model.vlm_tower, "processor", None)
         if processor_obj is None:
             batch = int(video.shape[0])
@@ -245,6 +257,7 @@ class ActionInferenceSession:
             pixel.float(),
             [instruction],
             model_max_length=int(getattr(self.model, "prompt_max_length", 512)),
+            wrist_pixel=wrist_pixel,
         )
 
     def _set_action_context(
@@ -283,10 +296,15 @@ class ActionInferenceSession:
         instruction: str,
         *,
         vggt_video: torch.Tensor | None = None,
+        wrist_video: torch.Tensor | None = None,
     ) -> None:
         if video.ndim != 5:
             raise ValueError(f"video must be [B,3,T,H,W], got {tuple(video.shape)}")
+        if self.use_wrist_view and wrist_video is None:
+            raise ValueError("use_wrist_view=True but wrist_video is missing.")
         video = video.to(device=self.model.device, dtype=self.model.torch_dtype)
+        if wrist_video is not None:
+            wrist_video = wrist_video.to(device=self.model.device, dtype=self.model.torch_dtype)
         self._video_clip = video.detach()
         batch_size = int(video.shape[0])
 
@@ -300,7 +318,9 @@ class ActionInferenceSession:
             )
             vggt_ctx, vggt_ctx_mask = None, None
         else:
-            vlm_inputs = self._build_vlm_inputs_from_video(video, instruction)
+            vlm_inputs = self._build_vlm_inputs_from_video(
+                video, instruction, wrist_video=wrist_video
+            )
             for key, value in vlm_inputs.items():
                 vlm_inputs[key] = value.to(device=self.model.device)
             self._vlm_inputs = vlm_inputs
@@ -309,6 +329,7 @@ class ActionInferenceSession:
                 vlm_inputs["attention_mask"],
                 vlm_inputs["pixel_values"],
                 vlm_inputs["image_grid_thw"],
+                vlm_inputs.get("mm_token_type_ids"),
             )
             vggt_src = vggt_video if vggt_video is not None else video[:, :, -1:, :, :]
             if self.model.uses_dual_vggt_cross_attn():
@@ -373,12 +394,15 @@ class ActionInferenceSession:
         *,
         prompt: Optional[str] = None,
         vggt_video: Optional[torch.Tensor] = None,
+        wrist_video: Optional[torch.Tensor] = None,
     ) -> None:
         if self.action_ctx is None:
             raise RuntimeError("Call prefill before refresh.")
         if prompt is None:
             raise ValueError("refresh_video_context_from_clip requires `prompt`.")
-        self._update_action_context_from_video(video, prompt, vggt_video=vggt_video)
+        self._update_action_context_from_video(
+            video, prompt, vggt_video=vggt_video, wrist_video=wrist_video
+        )
 
     @torch.no_grad()
     def refresh_video_context(
@@ -400,11 +424,14 @@ class ActionInferenceSession:
         *,
         prompt_cache: Optional[VLMContextCache] = None,
         vggt_video: Optional[torch.Tensor] = None,
+        wrist_video: Optional[torch.Tensor] = None,
     ) -> None:
         del prompt_cache
         if prompt is None:
             raise ValueError("prefill_from_video_clip requires `prompt`.")
-        self._update_action_context_from_video(video, prompt, vggt_video=vggt_video)
+        self._update_action_context_from_video(
+            video, prompt, vggt_video=vggt_video, wrist_video=wrist_video
+        )
 
     @torch.no_grad()
     def prefill_from_image(

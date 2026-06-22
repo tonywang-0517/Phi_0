@@ -98,11 +98,13 @@ class Phi0Processor:
         *,
         vlm_image_size: Tuple[int, int] = DEFAULT_VLM_IMAGE_SIZE,
         vlm_img_aug: bool = False,
+        use_wrist_view: bool = False,
     ):
         self.action_dim = action_dim
         self.normalize = normalize
         self.vlm_image_size = (int(vlm_image_size[0]), int(vlm_image_size[1]))
         self.vlm_img_aug = bool(vlm_img_aug)
+        self.use_wrist_view = bool(use_wrist_view)
         self._is_train = True
         self._vlm_transform = None
         self._vlm_transform_key: tuple[Any, ...] | None = None
@@ -232,6 +234,18 @@ class Phi0Processor:
             pixel = pixel[:, 0]
         else:
             raise ValueError(f"Expected ego_view [B,T,C,H,W] or [B,Cam,T,C,H,W], got {pixel.ndim}D")
+
+        wrist_pixel = None
+        if self.use_wrist_view:
+            wrist = batch.get("images", {}).get("wrist_view")
+            if wrist is None:
+                raise ValueError("use_wrist_view=True but batch missing images.wrist_view")
+            wrist_pixel = wrist.float()
+            if wrist_pixel.ndim != 5:
+                raise ValueError(
+                    f"Expected wrist_view [B,T,C,H,W], got {wrist_pixel.ndim}D"
+                )
+            pixel = torch.stack([pixel, wrist_pixel], dim=1)
 
         from phi0.models.vlm.preprocess import normalize_vlm_instruction
 

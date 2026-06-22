@@ -15,8 +15,8 @@ BenchmarkName = Literal["libero", "calvin"]
 
 @dataclass(frozen=True)
 class RldsStep:
-    rgb_static: np.ndarray
-    rgb_gripper: np.ndarray
+    rgb_static: np.ndarray | None
+    rgb_gripper: np.ndarray | None
     state: np.ndarray
     action: np.ndarray
     language: str

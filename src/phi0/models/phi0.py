@@ -531,6 +531,7 @@ class Phi0(torch.nn.Module):
             inputs["attention_mask"],
             inputs["pixel_values"],
             inputs["image_grid_thw"],
+            inputs.get("mm_token_type_ids"),
         )
 
     @staticmethod

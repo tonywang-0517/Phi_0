@@ -1,0 +1,13 @@
+# @package _global_
+# Ablation E: frozen VLM + ACT head 3 layers (0.5x baseline / 0.25x act12), mono camera, 4-GPU DDP, 35k steps.
+
+defaults:
+  - train_libero_spatial_vlm_only_35k_ddp4
+  - _self_
+
+output_dir: ./experiments/libero_spatial_vlm_act3_35k_ddp4
+checkpoint_name: libero_spatial_vlm_act3_35k_ddp4
+
+model:
+  action_dit_config:
+    num_layers: 3

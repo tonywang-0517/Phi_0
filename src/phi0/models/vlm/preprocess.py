@@ -125,8 +125,15 @@ def collate_vlm_inputs(
     """Pad token sequences like Psi0 ``PaddedCollatorForTogether``."""
     if not items:
         raise ValueError("items must be non-empty")
+    keep_keys = {
+        "input_ids",
+        "attention_mask",
+        "pixel_values",
+        "image_grid_thw",
+        "mm_token_type_ids",
+    }
     if len(items) == 1:
-        out = {k: v for k, v in items[0].items() if k in {"input_ids", "attention_mask", "pixel_values", "image_grid_thw"}}
+        out = {k: v for k, v in items[0].items() if k in keep_keys}
         if out["input_ids"].ndim == 1:
             out = {k: v.unsqueeze(0) if torch.is_tensor(v) else v for k, v in out.items()}
         return out
@@ -140,21 +147,40 @@ def collate_vlm_inputs(
         input_ids = input_ids[:, : int(model_max_length)]
     attention_mask = input_ids.ne(pad_token_id)
 
+    mm_token_type_ids = None
+    if items[0].get("mm_token_type_ids") is not None:
+        mm_rows = [
+            x["mm_token_type_ids"].squeeze(0)
+            if x["mm_token_type_ids"].ndim == 2
+            else x["mm_token_type_ids"]
+            for x in items
+        ]
+        mm_token_type_ids = pad_sequence(mm_rows, batch_first=True, padding_value=0)
+        if model_max_length is not None:
+            mm_token_type_ids = mm_token_type_ids[:, : int(model_max_length)]
+
     pixel_values = [x["pixel_values"] for x in items]
     if isinstance(pixel_values[0], torch.Tensor):
         pixel_values = torch.stack(pixel_values)
     else:
         pixel_values = {k: torch.stack([pv[k] for pv in pixel_values]) for k in pixel_values[0]}
 
-    image_grid_thw = torch.stack(
-        [x["image_grid_thw"].squeeze(0) for x in items]
-    )
-    return {
+    grid_rows = []
+    for x in items:
+        grid = x["image_grid_thw"]
+        if grid.ndim == 3 and grid.shape[0] == 1:
+            grid = grid.squeeze(0)
+        grid_rows.append(grid.reshape(-1, 3))
+    image_grid_thw = torch.cat(grid_rows, dim=0)
+    out = {
         "input_ids": input_ids,
         "attention_mask": attention_mask,
         "pixel_values": pixel_values,
         "image_grid_thw": image_grid_thw,
     }
+    if mm_token_type_ids is not None:
+        out["mm_token_type_ids"] = mm_token_type_ids
+    return out
 
 
 def build_vlm_chat_inputs(
@@ -192,8 +218,15 @@ def build_vlm_inputs_from_pixel_batch(
     training: bool = True,
     model_max_length: int | None = None,
     transform=None,
+    wrist_pixel: torch.Tensor | None = None,
 ) -> Dict[str, torch.Tensor]:
     """Resize/crop observation frame(s) Psi0-style, then tokenize with Qwen3-VL processor."""
+    if pixel.ndim == 6:
+        if pixel.shape[1] < 1:
+            raise ValueError(f"Expected at least one camera in pixel batch, got {tuple(pixel.shape)}")
+        if wrist_pixel is None and pixel.shape[1] >= 2:
+            wrist_pixel = pixel[:, 1]
+        pixel = pixel[:, 0]
     if pixel.ndim != 5:
         raise ValueError(f"Expected [B,T,C,H,W], got {tuple(pixel.shape)}")
     idx = int(frame_index)
@@ -203,6 +236,14 @@ def build_vlm_inputs_from_pixel_batch(
         raise ValueError(
             f"frame_index {frame_index} out of range for T={pixel.shape[1]}"
         )
+    if wrist_pixel is not None:
+        if wrist_pixel.ndim != 5:
+            raise ValueError(f"Expected wrist_pixel [B,T,C,H,W], got {tuple(wrist_pixel.shape)}")
+        if wrist_pixel.shape[0] != pixel.shape[0] or wrist_pixel.shape[1] != pixel.shape[1]:
+            raise ValueError(
+                "wrist_pixel batch/time dims must match pixel: "
+                f"{tuple(wrist_pixel.shape)} vs {tuple(pixel.shape)}"
+            )
 
     if transform is None:
         transform = make_psi0_vlm_image_transform(
@@ -212,8 +253,10 @@ def build_vlm_inputs_from_pixel_batch(
         )
     images: List[List[Image.Image]] = []
     for b in range(pixel.shape[0]):
-        pil = preprocess_frame_for_vlm(pixel[b, idx], transform)
-        images.append([pil])
+        view_pils = [preprocess_frame_for_vlm(pixel[b, idx], transform)]
+        if wrist_pixel is not None:
+            view_pils.append(preprocess_frame_for_vlm(wrist_pixel[b, idx], transform))
+        images.append(view_pils)
     return build_vlm_chat_inputs(
         processor,
         images,
@@ -237,6 +280,7 @@ def build_training_vlm_inputs_from_pixels(
     instructions: Sequence[str],
     *,
     model_max_length: int | None = None,
+    wrist_pixel: torch.Tensor | None = None,
 ) -> Dict[str, torch.Tensor]:
     """Training-path VLM tokenization (respects processor aug + train/eval mode)."""
     return build_vlm_inputs_from_pixel_batch(
@@ -249,6 +293,7 @@ def build_training_vlm_inputs_from_pixels(
         training=phi0_processor._is_train,
         model_max_length=model_max_length,
         transform=phi0_processor.vlm_image_transform(),
+        wrist_pixel=wrist_pixel,
     )
 
 
@@ -259,6 +304,7 @@ def build_deploy_vlm_inputs_from_pixels(
     instructions: Sequence[str],
     *,
     model_max_length: int | None = None,
+    wrist_pixel: torch.Tensor | None = None,
 ) -> Dict[str, torch.Tensor]:
     """Deterministic deploy VLM inputs aligned with training resize/crop (no ColorJitter)."""
     vlm_size = getattr(phi0_processor, "vlm_image_size", (180, 320))
@@ -276,4 +322,5 @@ def build_deploy_vlm_inputs_from_pixels(
         training=False,
         model_max_length=model_max_length,
         transform=transform,
+        wrist_pixel=wrist_pixel,
     )

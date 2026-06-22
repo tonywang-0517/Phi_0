@@ -1,0 +1,5 @@
+# LIBERO spatial with wrist camera fed into Qwen3-VL (agentview + wrist multi-image).
+defaults:
+  - libero_spatial
+
+mono_camera: false

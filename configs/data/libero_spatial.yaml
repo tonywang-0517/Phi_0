@@ -23,5 +23,9 @@ action_stats_path: ./data/libero/libero_spatial_delta_action_stats.json
 proprio_stats_path: ./data/libero/libero_spatial_eef_action_stats.json
 auto_compute_action_stats: true
 cache_video: false
-libero_cache_native_frames: true
+# Native-frame cache: uint8 tensors, auto-disabled when DDP×workers would replicate too many copies.
+libero_cache_native_frames: false
+libero_cache_auto_disable: true
+libero_cache_max_copies: 8
+# true = agentview only; false = agentview + wrist -> Qwen3-VL multi-image chat
 mono_camera: true

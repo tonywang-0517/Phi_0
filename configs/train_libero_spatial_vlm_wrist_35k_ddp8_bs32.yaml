@@ -1,0 +1,24 @@
+# @package _global_
+# Wrist + VLM, 8-GPU DDP, bs=32/GPU (eff=256), lr=1e-4, 35k steps.
+# Memory-balanced: 2 workers/rank, no native-frame cache at this scale (~480 GiB RAM vs ~2 TiB).
+
+defaults:
+  - train_libero_spatial_vlm_wrist_35k_ddp4
+  - _self_
+
+output_dir: ./experiments/libero_spatial_vlm_wrist_35k_ddp8_bs32
+checkpoint_name: libero_spatial_vlm_wrist_35k_ddp8_bs32
+
+batch_size: 32
+distributed: true
+
+num_workers: 2
+prefetch_factor: 2
+train_cpu_prefetch: 2
+dataloader_max_dataset_copies: 24
+dataloader_max_workers_per_rank: 2
+
+learning_rate_action: 1.0e-4
+learning_rate_warmup_steps: 1000
+learning_rate_scheduler: cosine
+lr_scale: none
