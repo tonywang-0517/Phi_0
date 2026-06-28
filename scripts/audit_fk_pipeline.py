@@ -117,21 +117,22 @@ def main():
     print("=" * 60)
     print("1) GT FK self-check (quat d_raw from HDF5 → FK → viz frame vs keypoints)")
     gt_fk = joints_from_d_raw_batch(gt_d_quat, constants, use_d_raw_betas=True)
-    gt_viz = fk_joints_to_keypoints_frame(gt_fk)
     kp = gt_h5["keypoints_hdf5"]
+    gt_viz = np.stack([fk_joints_to_keypoints_frame(gt_fk[i], kp[i]) for i in range(n)], axis=0)
     err_viz = np.linalg.norm(gt_viz - kp, axis=-1).mean(axis=1)
     print(f"   GT FK→viz vs HDF5 keypoints: mean joint L2 = {err_viz.mean():.4f} m (max frame {err_viz.max():.4f})")
 
     gt_fk_neutral = joints_from_d_raw_batch(gt_d_quat, constants, use_d_raw_betas=False)
     err_neutral = np.linalg.norm(
-        fk_joints_to_keypoints_frame(gt_fk_neutral) - kp, axis=-1
+        np.stack([fk_joints_to_keypoints_frame(gt_fk_neutral[i], kp[i]) for i in range(n)], axis=0) - kp,
+        axis=-1,
     ).mean(axis=1)
     print(f"   GT FK (neutral betas) vs keypoints: {err_neutral.mean():.4f} m")
 
     print("\n2) Root translation conventions (GT frame 0)")
     variants = fk_variants(gt_d_quat[:1], constants)
     for name, joints in variants.items():
-        j = fk_joints_to_keypoints_frame(joints[0])
+        j = fk_joints_to_keypoints_frame(joints[0], kp[0])
         e = np.linalg.norm(j - kp[0], axis=-1).mean()
         bs = bone_stats(j)
         print(f"   {name:20s} → keypoints L2={e:.4f}  bones mean={bs['mean']:.3f} max={bs['max']:.3f}")
@@ -160,7 +161,7 @@ def main():
     else:
         e_smpl = np.linalg.norm(ours_fk - j_smplx, axis=-1).mean()
         print(f"   our FK vs SMPL-X forward: {e_smpl:.2e} m (should be ~0)")
-        e_smpl_viz = np.linalg.norm(fk_joints_to_keypoints_frame(j_smplx[None])[0] - kp[0], axis=-1).mean()
+        e_smpl_viz = np.linalg.norm(fk_joints_to_keypoints_frame(j_smplx[None], kp[0:1])[0] - kp[0], axis=-1).mean()
         print(f"   SMPL-X→viz vs keypoints: {e_smpl_viz:.4f} m")
 
     print("\n7) body_quats layout check (GT frame 0 norms)")

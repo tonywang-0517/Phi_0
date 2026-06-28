@@ -354,6 +354,18 @@ class Phi0VLAPolicy:
 
     def _denormalize_robot7d_chunk(self, pred: torch.Tensor) -> np.ndarray:
         with torch.no_grad():
+            from phi0.data.simple_action_norm import SIMPLE_G1_DIM
+
+            raw_dim = int(getattr(self.model.action_expert, "raw_action_dim", 0))
+            if raw_dim == SIMPLE_G1_DIM:
+                return (
+                    self.processor.denormalize_robot_nd_future(pred.float(), dim=SIMPLE_G1_DIM)
+                    .detach()
+                    .cpu()
+                    .float()
+                    .numpy()
+                    .astype(np.float32)
+                )
             if self.model.uses_robot7d_action():
                 return (
                     self.processor.denormalize_robot7d_future(pred.float())

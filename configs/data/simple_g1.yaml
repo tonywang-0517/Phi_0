@@ -1,0 +1,13 @@
+# SIMPLE G1 whole-body LeRobot fine-tune (Psi0-aligned)
+
+dataset: simple_g1
+simple_root: ./data/simple
+simple_repo_id: G1WholebodyBendPick-v0-psi0
+simple_stats_path: null
+future_action_steps: 30
+val_ratio: 0.05
+normalize: true
+auto_compute_action_stats: false
+mono_camera: true
+control_fps: 20.0
+action_video_freq_ratio: 1

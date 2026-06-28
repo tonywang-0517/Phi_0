@@ -22,6 +22,18 @@ from phi0.data.action_stats import (
     resolve_proprio_stats_path,
     save_action_stats,
 )
+from phi0.data.simple_action_norm import (
+    SIMPLE_G1_DIM,
+    denormalize_robot_nd,
+    load_simple_stats_json,
+    normalize_robot_nd,
+    stats_view_for_robot_nd,
+)
+from phi0.data.sonic_action_norm import (
+    SONIC_ACTION_DIM,
+    SONIC_STATE_DIM,
+    load_sonic_stats_json,
+)
 from phi0.data.robot_action_norm import normalize_robot7d, stats_view_for_robot7d
 from phi0.checkpoint_utils import (
     checkpoint_paths,
@@ -31,8 +43,41 @@ from phi0.checkpoint_utils import (
 )
 from phi0.models.phi0 import Phi0
 from phi0.schema.draw_schema import D_RAW
+from phi0.schema.unified_action_schema import D_UNIFIED
 
 logger = logging.getLogger(__name__)
+
+
+def _resolve_raw_action_dim(model_cfg, data_cfg=None) -> int:
+    robot_dim = int(model_cfg.get("robot_action_dim", 0))
+    if robot_dim > 0:
+        return robot_dim
+    explicit = int(model_cfg.get("raw_action_dim", 0))
+    if explicit > 0:
+        return explicit
+    if data_cfg is not None and str(data_cfg.get("xperience_action_rep", "")).strip().lower() == "unified":
+        return D_UNIFIED
+    return D_RAW
+
+
+def _is_simple_dataset(data_cfg) -> bool:
+    return str(data_cfg.get("dataset", "")).strip().lower() == "simple_g1"
+
+
+def _is_sonic_unified_dataset(data_cfg) -> bool:
+    return str(data_cfg.get("dataset", "")).strip().lower() == "sonic_unified"
+
+
+def _is_pick_tissue_unified_dataset(data_cfg) -> bool:
+    return str(data_cfg.get("dataset", "")).strip().lower() == "pick_tissue_unified"
+
+
+def _is_lerobot_clip_dataset(data_cfg) -> bool:
+    return (
+        _is_simple_dataset(data_cfg)
+        or _is_sonic_unified_dataset(data_cfg)
+        or _is_pick_tissue_unified_dataset(data_cfg)
+    )
 
 
 def _mixed_precision_to_dtype(mp: str) -> torch.dtype:
@@ -255,11 +300,13 @@ def create_phi0(cfg: DictConfig, smoke: bool = False) -> Phi0:
         return create_phi0_action_only_smoke(
             device=device,
             torch_dtype=dtype,
+            raw_action_dim=_resolve_raw_action_dim(model_cfg, cfg.data),
             hidden_dim=int(action_dit.get("hidden_dim", 1024)),
             num_layers=int(action_dit.get("num_layers", 2)),
             text_dim=int(action_dit.get("text_dim", 512)),
             action_head=str(model_cfg.get("action_head", "fm")),
             past_action_window_size=int(model_cfg.get("past_action_window_size", 5)),
+            loss_lambda_bone=float(model_cfg.loss.get("lambda_bone", 0.0)),
         )
 
     ckpt_root = str(cfg.get("checkpoints_dir", "./checkpoints"))
@@ -277,11 +324,7 @@ def create_phi0(cfg: DictConfig, smoke: bool = False) -> Phi0:
             action_dit_config=action_dit,
             action_head=str(model_cfg.get("action_head", "fm")),
             action_fm_config=action_fm,
-            raw_action_dim=(
-                7
-                if int(model_cfg.get("robot_action_dim", 0)) == 7
-                else int(model_cfg.get("raw_action_dim", D_RAW))
-            ),
+            raw_action_dim=_resolve_raw_action_dim(model_cfg, cfg.data),
             loss_lambda_action=float(model_cfg.loss.lambda_action),
             loss_lambda_bone=float(model_cfg.loss.get("lambda_bone", 0.0)),
             loss_lambda_bone_hand=float(model_cfg.loss.get("lambda_bone_hand", 0.0)),
@@ -302,7 +345,7 @@ def create_phi0(cfg: DictConfig, smoke: bool = False) -> Phi0:
             vggt_use_full_video=bool(model_cfg.get("vggt_use_full_video", False)),
             vggt_tower=build_vggt_tower(cfg, device=device, torch_dtype=dtype),
         )
-        if int(model_cfg.get("robot_action_dim", 0)) == 7:
+        if int(model_cfg.get("robot_action_dim", 0)) > 0:
             model.robot_action_loss_type = str(
                 model_cfg.get("robot_action_loss_type", "l1")
             ).strip().lower()
@@ -322,11 +365,7 @@ def create_phi0(cfg: DictConfig, smoke: bool = False) -> Phi0:
         action_dit_config=action_dit,
         action_head=str(model_cfg.get("action_head", "fm")),
         action_fm_config=action_fm,
-        raw_action_dim=(
-            7
-            if int(model_cfg.get("robot_action_dim", 0)) == 7
-            else int(model_cfg.get("raw_action_dim", D_RAW))
-        ),
+        raw_action_dim=_resolve_raw_action_dim(model_cfg, cfg.data),
         loss_lambda_action=float(model_cfg.loss.lambda_action),
         loss_lambda_bone=float(model_cfg.loss.get("lambda_bone", 0.0)),
         loss_lambda_bone_hand=float(model_cfg.loss.get("lambda_bone_hand", 0.0)),
@@ -347,7 +386,7 @@ def create_phi0(cfg: DictConfig, smoke: bool = False) -> Phi0:
         vggt_use_full_video=bool(model_cfg.get("vggt_use_full_video", False)),
         vggt_tower=build_vggt_tower(cfg, device=device, torch_dtype=dtype),
     )
-    if int(model_cfg.get("robot_action_dim", 0)) == 7:
+    if int(model_cfg.get("robot_action_dim", 0)) > 0:
         model.robot_action_loss_type = str(
             model_cfg.get("robot_action_loss_type", "l1")
         ).strip().lower()
@@ -409,15 +448,85 @@ def build_base_dataset(
             mono_camera=bool(data_cfg.get("mono_camera", True)),
         )
 
+    if dataset_name == "simple_g1":
+        from phi0.data.simple_lerobot import SimpleG1ClipDataset
+
+        vlm_size = cfg.model.get("vlm", {}).get("image_size", [180, 320])
+        ds = SimpleG1ClipDataset(
+            root_dir=str(data_cfg.get("simple_root", "./data/simple")),
+            repo_id=str(data_cfg.get("simple_repo_id", "G1WholebodyBendPick-v0-psi0")),
+            future_action_steps=int(data_cfg.get("future_action_steps", 30)),
+            image_size=(int(vlm_size[0]), int(vlm_size[1])),
+            val=bool(data_cfg.get("val", False)),
+            val_ratio=float(data_cfg.get("val_ratio", 0.05)),
+            seed=int(cfg.get("seed", 42)),
+        )
+        stats_override = data_cfg.get("simple_stats_path")
+        if stats_override is not None and str(stats_override).lower() not in {"", "null", "none"}:
+            ds.set_stats_path(stats_override)
+        return ds
+
+    if dataset_name == "sonic_unified":
+        from phi0.data.sonic_lerobot import SonicUnifiedClipDataset
+
+        vlm_size = cfg.model.get("vlm", {}).get("image_size", [180, 320])
+        ds = SonicUnifiedClipDataset(
+            root_dir=str(data_cfg.get("sonic_root", "./data")),
+            repo_id=str(data_cfg.get("sonic_repo_id", "pick_tissue_sonic_unified")),
+            future_action_steps=int(data_cfg.get("future_action_steps", 30)),
+            image_size=(int(vlm_size[0]), int(vlm_size[1])),
+            val=bool(data_cfg.get("val", False)),
+            val_ratio=float(data_cfg.get("val_ratio", 0.05)),
+            seed=int(cfg.get("seed", 42)),
+            use_left_wrist=bool(data_cfg.get("use_left_wrist", not data_cfg.get("mono_camera", True))),
+        )
+        stats_override = data_cfg.get("sonic_stats_path")
+        if stats_override is not None and str(stats_override).lower() not in {"", "null", "none"}:
+            ds.set_stats_path(stats_override)
+        return ds
+
+    if dataset_name == "pick_tissue_unified":
+        from phi0.data.pick_tissue_unified import PickTissueUnifiedClipDataset
+
+        vlm_size = cfg.model.get("vlm", {}).get("image_size", [180, 320])
+        video_backend = data_cfg.get("video_backend")
+        if video_backend is not None and str(video_backend).lower() in {"", "null", "none"}:
+            video_backend = None
+        from phi0.data.temporal_align import proprio_current_control_step
+
+        train_obs_only = bool(data_cfg.get("train_obs_only_video", False))
+        past_w = int(cfg.model.get("past_action_window_size", 1))
+        return PickTissueUnifiedClipDataset(
+            root_dir=str(data_cfg.get("pick_tissue_root", "./data")),
+            repo_id=str(data_cfg.get("pick_tissue_repo_id", "pick_tissue_xperience_unified")),
+            seq_len=int(data_cfg.get("seq_len", 33)),
+            action_video_freq_ratio=int(data_cfg.get("action_video_freq_ratio", 2)),
+            image_size=(int(vlm_size[0]), int(vlm_size[1])),
+            val=bool(data_cfg.get("val", False)),
+            val_ratio=float(data_cfg.get("val_ratio", 0.05)),
+            seed=int(cfg.get("seed", 42)),
+            use_left_wrist=bool(data_cfg.get("use_left_wrist", not data_cfg.get("mono_camera", True))),
+            cache_video=bool(data_cfg.get("cache_video", True)),
+            video_cache_max_frames=int(data_cfg.get("video_cache_max_frames", 2048)),
+            video_backend=str(video_backend) if video_backend is not None else None,
+            use_predecoded_video=bool(data_cfg.get("use_predecoded_video", True)),
+            train_obs_only_video=train_obs_only,
+            obs_control_index=proprio_current_control_step(past_w) if train_obs_only else None,
+        )
+
     video_path = data_cfg.get("xperience_video")
     if video_path is not None and str(video_path).lower() in {"", "null", "none"}:
         video_path = None
     cache_video = bool(data_cfg.get("cache_video", True))
+    xperience_action_rep = str(data_cfg.get("xperience_action_rep", "keypoints")).strip().lower()
+    xperience_only = bool(data_cfg.get("xperience_only", False))
     return build_overfit_datasets(
         xperience_max_frames=int(data_cfg.get("xperience_max_frames", 32)),
         egodex_max_frames=int(data_cfg.get("egodex_max_frames", 32)),
         xperience_video=video_path,
         cache_video=cache_video,
+        xperience_action_rep=xperience_action_rep,
+        xperience_only=xperience_only,
     )
 
 
@@ -426,10 +535,50 @@ def build_dataloader(cfg: DictConfig, *, dist_ctx=None) -> DataLoader:
     loader_settings = resolve_dataloader_settings(cfg, dist_ctx=dist_ctx)
     log_dataloader_settings(loader_settings, logger=logger, dist_ctx=dist_ctx)
     base = build_base_dataset(cfg, dist_ctx=dist_ctx, loader_settings=loader_settings)
-    seq = sequence_dataset_from_cfg(base, data_cfg)
     num_workers = loader_settings.num_workers
     use_cuda = str(cfg.get("device", "cuda")).startswith("cuda") and torch.cuda.is_available()
-    loader_kwargs: Dict[str, Any] = {
+    if _is_lerobot_clip_dataset(data_cfg):
+        if _is_sonic_unified_dataset(data_cfg):
+            from phi0.data.sonic_lerobot import SonicUnifiedClipDataset
+
+            collate_fn = SonicUnifiedClipDataset.collate_fn
+        elif _is_pick_tissue_unified_dataset(data_cfg):
+            from phi0.data.pick_tissue_unified import PickTissueUnifiedClipDataset
+
+            collate_fn = PickTissueUnifiedClipDataset.collate_fn
+        else:
+            from phi0.data.simple_lerobot import SimpleG1ClipDataset
+
+            collate_fn = SimpleG1ClipDataset.collate_fn
+
+        loader_kwargs: Dict[str, Any] = {
+            "batch_size": int(cfg.batch_size),
+            "num_workers": num_workers,
+            "collate_fn": collate_fn,
+            "pin_memory": use_cuda,
+        }
+        if dist_ctx is not None and dist_ctx.enabled:
+            from torch.utils.data.distributed import DistributedSampler
+
+            loader_kwargs["sampler"] = DistributedSampler(
+                base,
+                num_replicas=dist_ctx.world_size,
+                rank=dist_ctx.rank,
+                shuffle=True,
+                drop_last=bool(cfg.get("ddp_drop_last", True)),
+            )
+            loader_kwargs["drop_last"] = bool(cfg.get("ddp_drop_last", True))
+        else:
+            loader_kwargs["shuffle"] = True
+            if bool(cfg.get("train_drop_last", False)):
+                loader_kwargs["drop_last"] = True
+        if num_workers > 0:
+            loader_kwargs["persistent_workers"] = True
+            loader_kwargs["prefetch_factor"] = loader_settings.prefetch_factor
+        return DataLoader(base, **loader_kwargs)
+
+    seq = sequence_dataset_from_cfg(base, data_cfg)
+    loader_kwargs = {
         "batch_size": int(cfg.batch_size),
         "num_workers": num_workers,
         "collate_fn": SequenceDataset.collate_fn,
@@ -521,13 +670,56 @@ def build_processor(cfg: DictConfig, *, dist_ctx=None) -> Phi0Processor:
     model_cfg = cfg.model
     vlm_cfg = model_cfg.get("vlm") or {}
     vlm_size = vlm_cfg.get("image_size", [180, 320])
+    robot_dim = int(model_cfg.get("robot_action_dim", 0))
+    action_dim = _resolve_raw_action_dim(model_cfg, data_cfg)
     processor = Phi0Processor(
+        action_dim=action_dim,
         normalize=bool(data_cfg.get("normalize", True)),
         vlm_image_size=(int(vlm_size[0]), int(vlm_size[1])),
         vlm_img_aug=bool(vlm_cfg.get("img_aug", False)),
-        use_wrist_view=not bool(data_cfg.get("mono_camera", True)),
+        use_wrist_view=bool(data_cfg.get("use_left_wrist", not data_cfg.get("mono_camera", True))),
     )
     if not processor.normalize:
+        return processor.train()
+    if _is_simple_dataset(data_cfg):
+        stats_raw = data_cfg.get("simple_stats_path")
+        if stats_raw is None or str(stats_raw).lower() in {"", "null", "none"}:
+            stats_path = (
+                Path(str(data_cfg.get("simple_root", "./data/simple")))
+                / str(data_cfg.get("simple_repo_id", "G1WholebodyBendPick-v0-psi0"))
+                / "meta"
+                / "stats_psi0.json"
+            )
+        else:
+            stats_path = Path(str(stats_raw))
+        action_stats = load_simple_stats_json(stats_path)
+        processor.register_stats_from_dict(action_stats)
+        proprio_stats = dict(action_stats)
+        proprio_stats["mean"] = action_stats.get("state_mean", action_stats["mean"])
+        proprio_stats["std"] = action_stats.get("state_std", action_stats["std"])
+        proprio_stats["q01"] = action_stats.get("state_q01", action_stats.get("q01"))
+        proprio_stats["q99"] = action_stats.get("state_q99", action_stats.get("q99"))
+        processor.register_proprio_stats_from_dict(proprio_stats)
+        return processor.train()
+    if _is_sonic_unified_dataset(data_cfg):
+        stats_raw = data_cfg.get("sonic_stats_path")
+        if stats_raw is None or str(stats_raw).lower() in {"", "null", "none"}:
+            stats_path = (
+                Path(str(data_cfg.get("sonic_root", "./data")))
+                / str(data_cfg.get("sonic_repo_id", "pick_tissue_sonic_unified"))
+                / "meta"
+                / "stats_sonic_unified.json"
+            )
+        else:
+            stats_path = Path(str(stats_raw))
+        action_stats = load_sonic_stats_json(stats_path)
+        processor.register_stats_from_dict(action_stats)
+        proprio_stats = dict(action_stats)
+        proprio_stats["mean"] = action_stats.get("state_mean", action_stats["mean"])
+        proprio_stats["std"] = action_stats.get("state_std", action_stats["std"])
+        proprio_stats["q01"] = action_stats.get("state_q01", action_stats.get("q01"))
+        proprio_stats["q99"] = action_stats.get("state_q99", action_stats.get("q99"))
+        processor.register_proprio_stats_from_dict(proprio_stats)
         return processor.train()
     allow_compute = dist_ctx is None or not dist_ctx.enabled or dist_ctx.is_main
     if dist_ctx is not None and dist_ctx.enabled and not dist_ctx.is_main:
@@ -585,7 +777,43 @@ def apply_processor_stats_from_checkpoint(
             stats = ensure_action_stats(cfg)
             if stats:
                 processor.register_stats_from_dict(stats)
-    if bool(cfg.data.get("libero_delta_eef", False)):
+    if _is_simple_dataset(cfg.data):
+        stats_raw = cfg.data.get("simple_stats_path")
+        if stats_raw is None or str(stats_raw).lower() in {"", "null", "none"}:
+            stats_path = (
+                Path(str(cfg.data.get("simple_root", "./data/simple")))
+                / str(cfg.data.get("simple_repo_id", "G1WholebodyBendPick-v0-psi0"))
+                / "meta"
+                / "stats_psi0.json"
+            )
+        else:
+            stats_path = Path(str(stats_raw))
+        action_stats = load_simple_stats_json(stats_path)
+        processor.register_stats_from_dict(action_stats)
+        proprio_stats = dict(action_stats)
+        proprio_stats["mean"] = action_stats.get("state_mean", action_stats["mean"])
+        proprio_stats["std"] = action_stats.get("state_std", action_stats["std"])
+        proprio_stats["q01"] = action_stats.get("state_q01", action_stats.get("q01"))
+        proprio_stats["q99"] = action_stats.get("state_q99", action_stats.get("q99"))
+    elif _is_sonic_unified_dataset(cfg.data):
+        stats_raw = cfg.data.get("sonic_stats_path")
+        if stats_raw is None or str(stats_raw).lower() in {"", "null", "none"}:
+            stats_path = (
+                Path(str(cfg.data.get("sonic_root", "./data")))
+                / str(cfg.data.get("sonic_repo_id", "pick_tissue_sonic_unified"))
+                / "meta"
+                / "stats_sonic_unified.json"
+            )
+        else:
+            stats_path = Path(str(stats_raw))
+        action_stats = load_sonic_stats_json(stats_path)
+        processor.register_stats_from_dict(action_stats)
+        proprio_stats = dict(action_stats)
+        proprio_stats["mean"] = action_stats.get("state_mean", action_stats["mean"])
+        proprio_stats["std"] = action_stats.get("state_std", action_stats["std"])
+        proprio_stats["q01"] = action_stats.get("state_q01", action_stats.get("q01"))
+        proprio_stats["q99"] = action_stats.get("state_q99", action_stats.get("q99"))
+    elif bool(cfg.data.get("libero_delta_eef", False)):
         proprio_stats = ensure_action_stats(cfg, proprio=True)
         if proprio_stats:
             processor.register_proprio_stats_from_dict(proprio_stats)
@@ -633,6 +861,71 @@ def _normalize_libero_absolute_batch(
     return _normalize_robot7d_chunk(processor, batch["robot_action_7d"].float(), proprio=False)
 
 
+def _normalize_robot_nd_chunk(
+    processor: Phi0Processor,
+    action: torch.Tensor,
+    *,
+    dim: int,
+    proprio: bool = False,
+) -> torch.Tensor:
+    stats = stats_view_for_robot_nd(processor, proprio=proprio, dim=dim)
+    return normalize_robot_nd(action.float(), stats, dim=dim, proprio=proprio)
+
+
+def _normalize_simple_g1_batch(
+    processor: Phi0Processor,
+    batch: Dict[str, Any],
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    proprio = batch["robot_proprio_36d"].float()
+    future = batch["robot_future_36d"].float()
+    norm_proprio = _normalize_robot_nd_chunk(
+        processor, proprio, dim=SIMPLE_G1_DIM, proprio=True
+    )
+    norm_future = _normalize_robot_nd_chunk(
+        processor, future, dim=SIMPLE_G1_DIM, proprio=False
+    )
+    normed = torch.cat([norm_proprio, norm_future], dim=1)
+    merged = torch.cat([proprio, future], dim=1)
+    return normed, merged, future
+
+
+def _embed_sonic_proprio_in_action_space(proprio: torch.Tensor) -> torch.Tensor:
+    """Map 43-d state into 100-d ACT token space (remaining dims stay zero)."""
+    if proprio.shape[-1] != SONIC_STATE_DIM:
+        raise ValueError(f"expected proprio dim {SONIC_STATE_DIM}, got {proprio.shape[-1]}")
+    out = torch.zeros(
+        *proprio.shape[:-1],
+        SONIC_ACTION_DIM,
+        device=proprio.device,
+        dtype=proprio.dtype,
+    )
+    out[..., :SONIC_STATE_DIM] = proprio
+    return out
+
+
+def _normalize_sonic_unified_batch(
+    processor: Phi0Processor,
+    batch: Dict[str, Any],
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    proprio = batch["robot_proprio_43d"].float()
+    future = batch["robot_future_100d"].float()
+    norm_proprio = _normalize_robot_nd_chunk(
+        processor, proprio, dim=SONIC_STATE_DIM, proprio=True
+    )
+    norm_future = _normalize_robot_nd_chunk(
+        processor, future, dim=SONIC_ACTION_DIM, proprio=False
+    )
+    normed = torch.cat(
+        [_embed_sonic_proprio_in_action_space(norm_proprio), norm_future],
+        dim=1,
+    )
+    merged = torch.cat(
+        [_embed_sonic_proprio_in_action_space(proprio), future],
+        dim=1,
+    )
+    return normed, merged, future
+
+
 def prepare_model_batch_cpu(
     model: Phi0,
     processor: Phi0Processor,
@@ -651,9 +944,20 @@ def prepare_model_batch_cpu(
         normalized_robot_action, merged_robot_7d, future_delta_7d = (
             _normalize_libero_proprio_delta_batch(processor, batch)
         )
-    elif "robot_action_7d" in batch and model.uses_robot7d_action():
+    elif "robot_proprio_36d" in batch and "robot_future_36d" in batch:
+        normalized_robot_action, merged_robot_7d, future_delta_7d = (
+            _normalize_simple_g1_batch(processor, batch)
+        )
+    elif "robot_proprio_43d" in batch and "robot_future_100d" in batch:
+        normalized_robot_action, merged_robot_7d, future_delta_7d = (
+            _normalize_sonic_unified_batch(processor, batch)
+        )
+    elif "robot_action_7d" in batch and model.uses_robot_lowdim_action():
         normalized_robot_action = _normalize_libero_absolute_batch(processor, batch)
-    sample = processor.preprocess(batch_work)
+    skip_action_norm = normalized_robot_action is not None
+    if skip_action_norm:
+        batch_work = {**batch, "action": normalized_robot_action}
+    sample = processor.preprocess(batch_work, skip_action_norm=skip_action_norm)
     if normalized_robot_action is not None:
         sample["action"] = normalized_robot_action
 
@@ -683,17 +987,29 @@ def prepare_model_batch_cpu(
     if wrist_pixel is not None:
         obs_wrist_pixel = wrist_pixel[:, frame_idx : frame_idx + 1]
 
+    from phi0.models.vlm.tower import SmokeVLMTower
+
     processor_obj = getattr(model.vlm_tower, "processor", None)
-    if processor_obj is None:
+    if isinstance(model.vlm_tower, SmokeVLMTower):
+        batch_size = int(obs_pixel.shape[0])
+        seq = int(getattr(model.vlm_tower, "num_context_tokens", 16))
+        vlm_inputs = {
+            "input_ids": torch.zeros(batch_size, seq, dtype=torch.long),
+            "attention_mask": torch.ones(batch_size, seq, dtype=torch.long),
+            "pixel_values": obs_pixel,
+            "image_grid_thw": torch.zeros(batch_size, 3, dtype=torch.long),
+        }
+    elif processor_obj is None:
         raise RuntimeError("VLM tower missing HuggingFace processor.")
-    vlm_inputs = build_training_vlm_inputs_from_pixels(
-        processor_obj,
-        processor,
-        obs_pixel,
-        sample["instruction"],
-        model_max_length=int(getattr(model, "prompt_max_length", 512)),
-        wrist_pixel=obs_wrist_pixel,
-    )
+    else:
+        vlm_inputs = build_training_vlm_inputs_from_pixels(
+            processor_obj,
+            processor,
+            obs_pixel,
+            sample["instruction"],
+            model_max_length=int(getattr(model, "prompt_max_length", 512)),
+            wrist_pixel=obs_wrist_pixel,
+        )
 
     payload.update(
         {
@@ -702,6 +1018,17 @@ def prepare_model_batch_cpu(
         }
     )
     return payload
+
+
+def _control_indices_sequence(indices: Any) -> list[int]:
+    if indices is None:
+        return []
+    if torch.is_tensor(indices):
+        flat = indices.detach().cpu().reshape(-1).tolist()
+        return [int(x) for x in flat]
+    if isinstance(indices, int):
+        return [int(indices)]
+    return [int(x) for x in indices]
 
 
 def _resolve_observation_frame_index(
@@ -716,8 +1043,8 @@ def _resolve_observation_frame_index(
     )
 
     past_w = int(getattr(model, "past_action_window_size", 1))
-    video_ctrl = batch.get("video_control_indices")
-    if video_ctrl is not None:
+    video_ctrl = _control_indices_sequence(batch.get("video_control_indices"))
+    if video_ctrl:
         return observation_subsampled_frame_index(past_w, video_ctrl)
     ratio = int(batch.get("action_video_freq_ratio") or 2)
     seq_len = int(batch["action_is_pad"].shape[1])
@@ -796,6 +1123,10 @@ def prepare_model_batch_gpu(
         out["robot_future_delta_7d"] = batch_work["robot_future_delta_7d"].to(
             device=device, dtype=torch.float32
         )
+    if batch_work.get("robot_future_100d") is not None:
+        out["robot_future_100d"] = batch_work["robot_future_100d"].to(
+            device=device, dtype=torch.float32
+        )
 
     tower_streams = get_tower_prep_streams(device)
     vlm_stream = tower_streams.vlm if tower_streams is not None else None
@@ -843,11 +1174,12 @@ def prepare_model_batch_gpu(
             out["vggt_ctx"] = vggt_ctx.detach()
             out["vggt_ctx_mask"] = vggt_ctx_mask
 
-        default_stream = torch.cuda.current_stream(device)
-        if vlm_stream is not None:
-            default_stream.wait_stream(vlm_stream)
-        if vggt_stream is not None:
-            default_stream.wait_stream(vggt_stream)
+        if device.type == "cuda":
+            default_stream = torch.cuda.current_stream(device)
+            if vlm_stream is not None:
+                default_stream.wait_stream(vlm_stream)
+            if vggt_stream is not None:
+                default_stream.wait_stream(vggt_stream)
 
     return out
 

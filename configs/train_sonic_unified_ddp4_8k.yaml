@@ -1,0 +1,25 @@
+# @package _global_
+# Phi_0 ACT fine-tune on pick-tissue SONIC unified — 4-GPU DDP, 8k steps.
+
+defaults:
+  - train_sonic_unified_act
+  - _self_
+
+seed: 20260626
+output_dir: ./experiments/pick_tissue_sonic_unified_8k_ddp4
+checkpoint_name: pick_tissue_sonic_unified_act
+max_steps: 8000
+save_every_steps: 4000
+checkpoint_overwrite: true
+auto_resume: false
+
+batch_size: 8
+num_workers: 8
+prefetch_factor: 4
+mixed_precision: bf16
+distributed: false
+ddp_drop_last: true
+ddp_find_unused_parameters: true
+
+learning_rate_warmup_steps: 500
+learning_rate_scheduler: cosine

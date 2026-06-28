@@ -36,6 +36,13 @@ train = [
   "wandb>=0.23.0",
   "fastwam",
 ]
+serve = [
+  "fastapi>=0.115.0",
+  "uvicorn>=0.32.0",
+]
+simple = [
+  "lerobot>=0.1.0",
+]
 viz = [
   "smplx>=0.1.28",
   "trimesh>=4.0.0",

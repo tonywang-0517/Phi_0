@@ -4,6 +4,9 @@ Training / deploy supervise **keypoints only** (52 joints × xyz = 156-d, indice
 Indices 156:211 are a fixed legacy buffer gap (always masked). 211:256 are storage slots
 (betas / tactile / reserved), never predicted. Legacy quat layout 0:211 lives in
 ``LEGACY_QUAT_SLICES`` for FK audit scripts only.
+
+For the full SMPL-H + SONIC + contact + tactile layout see
+``phi0.schema.unified_action_schema`` (``D_UNIFIED=512``).
 """
 
 from __future__ import annotations

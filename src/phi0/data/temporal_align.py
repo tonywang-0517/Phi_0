@@ -94,7 +94,7 @@ def observation_subsampled_frame_index(
     subsampled_control_indices: Sequence[int],
 ) -> int:
     """Index into subsampled pixel ``[B,T,C,H,W]`` aligned with proprio current step."""
-    if not subsampled_control_indices:
+    if len(subsampled_control_indices) == 0:
         raise ValueError("subsampled_control_indices must be non-empty")
     anchor = proprio_current_control_step(past_action_window_size)
     return int(

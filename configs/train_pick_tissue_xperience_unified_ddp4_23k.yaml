@@ -1,0 +1,11 @@
+# @package _global_
+# Resume pick-tissue 3k fast run → 23k total (+20k steps).
+
+defaults:
+  - train_pick_tissue_xperience_unified_ddp4_3k
+  - _self_
+
+max_steps: 23000
+save_every_steps: 4000
+auto_resume: true
+learning_rate_warmup_steps: 0

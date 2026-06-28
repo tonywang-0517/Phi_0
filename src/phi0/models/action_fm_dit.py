@@ -119,6 +119,7 @@ class ActionFMDiT(nn.Module):
             "num_query_adapter_layers",
             "num_query_refine_blocks",
             "query_adapter_heads",
+            "future_placeholder_noise_std",
         ):
             cfg.pop(legacy_key, None)
         cfg.setdefault("interleave_self_attention", True)

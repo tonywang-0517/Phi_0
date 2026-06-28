@@ -88,18 +88,26 @@ def compute_tactile_proxy_from_tip_positions(
     return np.asarray(out, dtype=np.float32)
 
 
-def zero_unsupervised_action_dims(action):
+def zero_unsupervised_action_dims(action, *, unified_dataset: str = "g1_sonic"):
     import torch
+
+    from phi0.schema.unified_action_schema import D_UNIFIED, zero_unsupervised_unified_action_dims
 
     if not isinstance(action, torch.Tensor):
         raise TypeError("zero_unsupervised_action_dims expects a torch.Tensor")
+    if int(action.shape[-1]) == D_UNIFIED:
+        return zero_unsupervised_unified_action_dims(action, dataset_name=unified_dataset)
     out = action.clone()
     out[..., get_action_schema().pose_dim_end :] = 0.0
     return out
 
 
-def zero_unsupervised_action_dims_np(d_raw: np.ndarray) -> np.ndarray:
+def zero_unsupervised_action_dims_np(d_raw: np.ndarray, *, unified_dataset: str = "g1_sonic") -> np.ndarray:
+    from phi0.schema.unified_action_schema import D_UNIFIED, zero_unsupervised_unified_action_dims_np
+
     out = np.asarray(d_raw, dtype=np.float32).copy()
+    if int(out.shape[-1]) == D_UNIFIED:
+        return zero_unsupervised_unified_action_dims_np(out, dataset_name=unified_dataset)
     out[..., get_action_schema().pose_dim_end :] = 0.0
     return out
 

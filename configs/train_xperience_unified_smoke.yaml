@@ -1,0 +1,26 @@
+# @package _global_
+# CPU smoke: Xperience unified GT + 2 train steps
+
+defaults:
+  - _self_
+  - model: phi0_xperience_unified
+  - data: xperience_unified
+
+output_dir: ./experiments/xperience_unified_smoke
+batch_size: 1
+num_workers: 0
+learning_rate: 1.0e-4
+max_steps: 2
+mixed_precision: "no"
+device: cpu
+smoke_action_only: true
+
+data:
+  xperience_max_frames: 16
+
+hydra:
+  job:
+    chdir: false
+  run:
+    dir: .
+  output_subdir: null

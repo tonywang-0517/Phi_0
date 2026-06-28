@@ -1,0 +1,14 @@
+# @package data
+# SONIC unified: 43-d state, 100-d action (36 pi05 base + 64 motion_token)
+# Vision: egocentric + left wrist (no right wrist).
+
+dataset: sonic_unified
+sonic_root: /mnt/data2/wpy/workspace/Isaac-GR00T/data
+sonic_repo_id: pick_tissue_sonic_unified
+sonic_stats_path: null
+future_action_steps: 30
+val_ratio: 0.05
+val: false
+normalize: true
+mono_camera: false
+use_left_wrist: true

@@ -6,9 +6,14 @@ import numpy as np
 import pytest
 import torch
 
-from phi0.data.action_stats import compute_action_stats_from_datasets, stats_to_tensors
+from phi0.data.action_stats import (
+    compute_action_stats_from_datasets,
+    masked_unified_action_stats,
+    stats_to_tensors,
+)
 from phi0.data.xperience import XperienceDataset
 from phi0.schema.draw_schema import D_RAW
+from phi0.schema.unified_action_schema import D_UNIFIED, dim_mask_for_dataset
 
 
 class _TinyDataset:
@@ -25,6 +30,21 @@ class _TinyDataset:
             "action": torch.from_numpy(x).unsqueeze(0),
             "action_dim_is_pad": torch.from_numpy(pad),
         }
+
+
+def test_masked_unified_action_stats_respects_g1_sonic_mask():
+    mask = dim_mask_for_dataset("g1_sonic")
+    acts = np.zeros((4, D_UNIFIED), dtype=np.float32)
+    acts[:, 0] = 99.0  # unsupervised root_trans_local
+    acts[:, 396:400] = np.linspace(0.1, 0.4, 4)[:, None]  # supervised sonic token
+    acts[:, 460] = 77.0  # reserved padding
+    stats = masked_unified_action_stats(acts, supervised_mask=mask)
+    assert stats["mean"][0] == pytest.approx(0.0, abs=1e-6)
+    assert stats["std"][0] == pytest.approx(1.0, abs=1e-6)
+    assert stats["mean"][396] == pytest.approx(0.25, abs=1e-5)
+    assert stats["std"][396] > 0.01
+    assert stats["mean"][460] == pytest.approx(0.0, abs=1e-6)
+    assert stats["std"][460] == pytest.approx(1.0, abs=1e-6)
 
 
 def test_compute_action_stats_masked_dims():

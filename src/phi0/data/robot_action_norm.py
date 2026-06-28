@@ -12,6 +12,7 @@ DELTA_TRANSLATE_ROT_DIMS = 6
 STATS_SEMANTICS_DELTA = "libero_delta_eef_6d"
 STATS_SEMANTICS_ABSOLUTE = "libero_absolute_eef_7d"
 STATS_SEMANTICS_PROPRIO = "libero_proprio_absolute_eef_7d"
+STATS_SEMANTICS_XPERIENCE_UNIFIED = "xperience_unified_smplh_512"
 
 
 def _cfg_get(data_cfg: Any, key: str, default: Any = None) -> Any:
@@ -23,6 +24,11 @@ def _cfg_get(data_cfg: Any, key: str, default: Any = None) -> Any:
 def stats_semantics_for_cfg(data_cfg: Mapping[str, Any], *, proprio: bool = False) -> str:
     if proprio:
         return STATS_SEMANTICS_PROPRIO
+    dataset = str(_cfg_get(data_cfg, "dataset", "")).strip().lower()
+    if dataset in {"xperience_unified", "pick_tissue_unified"}:
+        return STATS_SEMANTICS_XPERIENCE_UNIFIED
+    if str(_cfg_get(data_cfg, "xperience_action_rep", "")).strip().lower() == "unified":
+        return STATS_SEMANTICS_XPERIENCE_UNIFIED
     if bool(_cfg_get(data_cfg, "libero_delta_eef", False)):
         return STATS_SEMANTICS_DELTA
     if bool(_cfg_get(data_cfg, "libero_absolute_eef", True)):
@@ -152,9 +158,11 @@ def stats_dict_from_tensors(
     q99: Optional[torch.Tensor] = None,
     normalize_gripper: bool = True,
     supervised_mask: Optional[list[bool]] = None,
+    action_dim: Optional[int] = None,
 ) -> dict[str, Any]:
     from phi0.schema.draw_schema import D_RAW
 
+    dim = int(action_dim or mean.numel() or D_RAW)
     if supervised_mask is None:
         supervised = (std > 1e-8).tolist()
     else:
@@ -165,7 +173,7 @@ def stats_dict_from_tensors(
         "norm_mode": norm_mode,
         "normalize_gripper": normalize_gripper,
         "robot_dim": ROBOT_DIM,
-        "action_dim": D_RAW,
+        "action_dim": dim,
         "num_frames": num_frames,
         "supervised_mask": supervised,
         "mean": mean.detach().cpu().float().tolist(),

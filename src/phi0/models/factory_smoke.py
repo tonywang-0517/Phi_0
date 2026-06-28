@@ -18,6 +18,7 @@ def create_phi0_action_only_smoke(
     text_dim: int = 512,
     action_head: str = "fm",
     past_action_window_size: int = 1,
+    loss_lambda_bone: float = 0.0,
 ) -> Phi0:
     """Minimal Phi0 for CPU smoke tests without HuggingFace downloads."""
     action_dit_config = {
@@ -53,7 +54,7 @@ def create_phi0_action_only_smoke(
         torch_dtype=torch_dtype,
         loss_lambda_video=0.0,
         loss_lambda_action=1.0,
-        loss_lambda_bone=0.1,
+        loss_lambda_bone=float(loss_lambda_bone),
         action_head=action_head,
         past_action_window_size=int(past_action_window_size),
     )

@@ -1,0 +1,24 @@
+# Pick-tissue unified 512-d SMPL-H action (Humanoid-GPT / xperience_unified path)
+# @package data
+
+dataset: pick_tissue_unified
+pick_tissue_root: /mnt/data2/wpy/workspace/Isaac-GR00T/data
+pick_tissue_repo_id: pick_tissue_xperience_unified
+action_dim: 512
+seq_len: 33
+control_fps: 50.0
+action_video_freq_ratio: 2
+dataset_native_fps:
+  g1_sonic: 50.0
+cache_video: true
+video_cache_max_frames: 2048
+use_predecoded_video: true
+train_obs_only_video: true
+video_backend: torchcodec
+normalize: true
+mono_camera: false
+use_left_wrist: true
+action_norm_mode: z-score
+action_stats_path: /mnt/data2/wpy/workspace/Isaac-GR00T/data/pick_tissue_xperience_unified/meta/stats_pick_tissue_unified.json
+auto_compute_action_stats: true
+val_ratio: 0.05

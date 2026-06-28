@@ -17,6 +17,17 @@ from phi0.data.robot_action_norm import (
     processor_stats_dict,
     stats_view_for_robot7d,
 )
+from phi0.data.simple_action_norm import (
+    SIMPLE_G1_DIM,
+    STATS_SEMANTICS_SIMPLE_G1,
+    denormalize_robot_nd,
+    normalize_robot_nd,
+    stats_view_for_robot_nd,
+)
+from phi0.data.sonic_action_norm import (
+    SONIC_ACTION_DIM,
+    STATS_SEMANTICS_SONIC_UNIFIED,
+)
 
 
 DEFAULT_VLM_IMAGE_SIZE = (180, 320)
@@ -68,17 +79,24 @@ def build_overfit_datasets(
     xperience_video: str | Path | None = None,
     cache_video: bool = True,
     image_size: Tuple[int, int] = DEFAULT_VLM_IMAGE_SIZE,
-) -> Phi0MixedDataset:
+    *,
+    xperience_action_rep: str = "keypoints",
+    xperience_only: bool = False,
+) -> Phi0MixedDataset | Dataset:
     from phi0.data.xperience import XperienceDataset
 
+    xp = XperienceDataset(
+        max_frames=xperience_max_frames,
+        video_path=xperience_video,
+        cache_video=cache_video,
+        image_size=image_size,
+        action_rep=xperience_action_rep,
+    )
+    if xperience_only:
+        return xp
     return Phi0MixedDataset(
         [
-            XperienceDataset(
-                max_frames=xperience_max_frames,
-                video_path=xperience_video,
-                cache_video=cache_video,
-                image_size=image_size,
-            ),
+            xp,
             EgoDexDataset(
                 max_frames=egodex_max_frames,
                 cache_video=cache_video,
@@ -137,7 +155,14 @@ class Phi0Processor:
         self.register_stats_from_dict(load_action_stats(path))
 
     def register_proprio_stats_from_dict(self, stats: dict) -> None:
-        mean, std, q01, q99 = stats_to_tensors(stats, self.action_dim)
+        proprio_dim = int(stats.get("state_dim", 0)) or self.action_dim
+        proprio_stats = {
+            "mean": stats.get("state_mean", stats["mean"]),
+            "std": stats.get("state_std", stats["std"]),
+            "q01": stats.get("state_q01", stats.get("q01", stats["mean"])),
+            "q99": stats.get("state_q99", stats.get("q99", stats["mean"])),
+        }
+        mean, std, q01, q99 = stats_to_tensors(proprio_stats, proprio_dim)
         self.proprio_mean = mean
         self.proprio_std = std.clamp(min=1e-6)
         self.proprio_q01 = q01
@@ -183,7 +208,28 @@ class Phi0Processor:
         s = self.std.to(action.device, dtype=action.dtype)
         return (action - m) / s
 
+    def _uses_simple_g1_stats(self) -> bool:
+        return (
+            self.action_dim == SIMPLE_G1_DIM
+            or self.robot_action_semantics == STATS_SEMANTICS_SIMPLE_G1
+        )
+
+    def _uses_sonic_unified_stats(self) -> bool:
+        return (
+            self.action_dim == SONIC_ACTION_DIM
+            or self.robot_action_semantics == STATS_SEMANTICS_SONIC_UNIFIED
+        )
+
     def _denormalize_action(self, action: torch.Tensor) -> torch.Tensor:
+        if self._uses_simple_g1_stats() or self._uses_sonic_unified_stats():
+            dim = SIMPLE_G1_DIM if self._uses_simple_g1_stats() else SONIC_ACTION_DIM
+            stats = stats_view_for_robot_nd(self, proprio=False, dim=dim)
+            out_dim = min(int(action.shape[-1]), dim)
+            out = action.clone()
+            out[..., :out_dim] = denormalize_robot_nd(
+                action[..., :out_dim], stats, dim=out_dim, proprio=False
+            )
+            return out
         if self.action_norm_mode == "bounds_q99":
             out = action.clone()
             stats = stats_view_for_robot7d(self, proprio=False)
@@ -210,6 +256,26 @@ class Phi0Processor:
             denormalize_gripper=False,
         )
 
+    def denormalize_robot_nd_future(
+        self,
+        pred_norm: torch.Tensor,
+        *,
+        dim: int = SIMPLE_G1_DIM,
+    ) -> torch.Tensor:
+        """Denormalize normalized future chunk to physical low-dim robot controls."""
+        stats = stats_view_for_robot_nd(self, proprio=False, dim=dim)
+        return denormalize_robot_nd(pred_norm[..., :dim], stats, dim=dim, proprio=False)
+
+    def normalize_robot_nd_tensor(
+        self,
+        action: torch.Tensor,
+        *,
+        dim: int = SIMPLE_G1_DIM,
+        proprio: bool = False,
+    ) -> torch.Tensor:
+        stats = stats_view_for_robot_nd(self, proprio=proprio, dim=dim)
+        return normalize_robot_nd(action, stats, dim=dim, proprio=proprio)
+
     def normalize_robot7d_tensor(
         self,
         action_7d: torch.Tensor,
@@ -223,9 +289,9 @@ class Phi0Processor:
             grip = True
         return normalize_robot7d(action_7d, stats, normalize_gripper=grip)
 
-    def preprocess(self, batch: Dict[str, Any]) -> Dict[str, Any]:
+    def preprocess(self, batch: Dict[str, Any], *, skip_action_norm: bool = False) -> Dict[str, Any]:
         action = batch["action"].float()
-        action_norm = self._normalize_action(action)
+        action_norm = action if skip_action_norm else self._normalize_action(action)
 
         pixel = batch["images"]["ego_view"].float()
         if pixel.ndim == 5:

@@ -12,6 +12,8 @@ import json
 from pathlib import Path
 from typing import Iterable
 
+from dataclasses import dataclass
+
 import numpy as np
 
 from phi0.schema.draw_schema import D_RAW
@@ -30,6 +32,9 @@ SMPLH_PARENTS = np.array(
 # fmt: on
 
 NUM_JOINTS = len(SMPLH_PARENTS)
+
+# Ankles + toe bases (SMPL-H 52-joint layout).
+FOOT_JOINT_INDICES = np.array([7, 8, 10, 11], dtype=np.int32)
 
 # SMPL-X has 55 joints; indices 22–24 are face (parent=head). Xperience / GR00T 52-joint
 # keypoints omit those and pack left/right hand chains at 22–36 and 37–51 instead.
@@ -72,6 +77,114 @@ def set_equal_3d_limits(ax, points: np.ndarray, margin: float = 1.2) -> None:
     ax.set_ylim(center[1] - radius, center[1] + radius)
     ax.set_zlim(center[2] - radius, center[2] + radius)
 
+
+def compute_fixed_3d_bounds(
+    *joint_sets: np.ndarray,
+    margin: float = 1.15,
+) -> tuple[np.ndarray, float]:
+    """Cubic (center, radius) over multiple world-frame joint arrays — fixed across frames."""
+    if not joint_sets:
+        raise ValueError("compute_fixed_3d_bounds needs at least one joint array")
+    pts = np.concatenate(
+        [np.asarray(j, dtype=np.float32).reshape(-1, 3) for j in joint_sets],
+        axis=0,
+    )
+    center = pts.mean(axis=0)
+    radius = float(np.max(np.linalg.norm(pts - center, axis=1))) * margin + 1e-3
+    return center.astype(np.float32), radius
+
+
+def as_absolute_world_joints(joints_world: np.ndarray) -> np.ndarray:
+    """Pass-through Isaac ``Ts_world_root`` FK joints (Z-up, meters). No display remapping."""
+    return np.asarray(joints_world, dtype=np.float32)
+
+
+@dataclass(frozen=True)
+class FixedStandingWorldFrame:
+    """Clip-constant rigid map: Isaac world FK -> standing matplotlib frame.
+
+    - ``anchor_pelvis_world``: dataset pelvis at clip ``native_start`` (fixed world origin).
+    - ``foot_z_floor``: standing-frame Z of the lowest foot over the clip; subtract so floor=0.
+    """
+
+    anchor_pelvis_world: np.ndarray
+    foot_z_floor: float
+
+
+def _isaac_world_delta_to_standing(delta: np.ndarray) -> np.ndarray:
+    """Rigid orthogonal remap on world deltas: (x,y,z) -> (x, z, -y), +Z up standing."""
+    d = np.asarray(delta, dtype=np.float32).reshape(-1, 3)
+    return np.stack([d[:, 0], d[:, 2], -d[:, 1]], axis=-1).astype(np.float32)
+
+
+def build_fixed_standing_world_frame(
+    anchor_pelvis_world: np.ndarray,
+    *joints_world_sets: np.ndarray,
+) -> FixedStandingWorldFrame:
+    """Build one standing viz frame for a clip (shared by Pred/GT/Dataset)."""
+    anchor = np.asarray(anchor_pelvis_world, dtype=np.float32).reshape(3)
+    foot_z: list[float] = []
+    for joints in joints_world_sets:
+        j = np.asarray(joints, dtype=np.float32).reshape(-1, 3)
+        standing = _isaac_world_delta_to_standing(j - anchor.reshape(1, 3))
+        foot_z.append(float(np.min(standing[FOOT_JOINT_INDICES, 2])))
+    return FixedStandingWorldFrame(
+        anchor_pelvis_world=anchor,
+        foot_z_floor=float(min(foot_z)) if foot_z else 0.0,
+    )
+
+
+def apply_fixed_standing_world_frame(
+    joints_world: np.ndarray,
+    frame: FixedStandingWorldFrame,
+) -> np.ndarray:
+    """Map absolute world FK joints into the clip-fixed standing frame (feet on z=0 floor)."""
+    anchor = frame.anchor_pelvis_world.reshape(1, 3)
+    out = _isaac_world_delta_to_standing(np.asarray(joints_world, dtype=np.float32) - anchor)
+    out[:, 2] -= np.float32(frame.foot_z_floor)
+    return out
+
+
+def draw_ground_plane(ax, center: np.ndarray, radius: float, *, z: float = 0.0, alpha: float = 0.15) -> None:
+    """Gray floor at ``z`` for standing viz."""
+    x0, x1 = float(center[0] - radius), float(center[0] + radius)
+    y0, y1 = float(center[1] - radius), float(center[1] + radius)
+    xx, yy = np.meshgrid(np.linspace(x0, x1, 2), np.linspace(y0, y1, 2))
+    zz = np.full_like(xx, z, dtype=np.float32)
+    ax.plot_surface(xx, yy, zz, color="gray", alpha=alpha, linewidth=0, antialiased=False)
+
+
+def skeleton_coords_for_mpl3d(
+    joints_world: np.ndarray,
+    *,
+    frame: FixedStandingWorldFrame | None = None,
+) -> np.ndarray:
+    if frame is None:
+        return as_absolute_world_joints(joints_world)
+    return apply_fixed_standing_world_frame(joints_world, frame)
+
+
+def configure_mpl3d_skeleton_axes(ax, *, z_label: str = "z (m)") -> None:
+    """Shared camera / labels for skeleton figures."""
+    ax.view_init(elev=15, azim=-70)
+    ax.set_xlabel("x (m)")
+    ax.set_ylabel("y (m)")
+    ax.set_zlabel(z_label)
+
+
+def draw_skeleton_world(
+    ax,
+    joints_world: np.ndarray,
+    *,
+    color: str = "darkgreen",
+    alpha: float = 0.9,
+    linewidth: float = 1.2,
+) -> np.ndarray:
+    """Draw absolute world-frame FK joints."""
+    display = as_absolute_world_joints(joints_world)
+    draw_skeleton(ax, display, color=color, alpha=alpha, linewidth=linewidth)
+    configure_mpl3d_skeleton_axes(ax)
+    return display
 
 def load_jsonl_predictions(path: Path) -> tuple[np.ndarray, list[dict]]:
     """Load deploy JSONL; return (d_raw[T,D_RAW], raw frame dicts)."""
@@ -159,10 +272,13 @@ def compute_scene_bounds(
     return center, radius
 
 
-def apply_scene_limits(ax, center: np.ndarray, radius: float) -> None:
+def apply_scene_limits(ax, center: np.ndarray, radius: float, *, ground_at_z0: bool = False) -> None:
     ax.set_xlim(center[0] - radius, center[0] + radius)
     ax.set_ylim(center[1] - radius, center[1] + radius)
-    ax.set_zlim(center[2] - radius, center[2] + radius)
+    if ground_at_z0:
+        ax.set_zlim(0.0, center[2] + radius)
+    else:
+        ax.set_zlim(center[2] - radius, center[2] + radius)
 
 
 def iter_bone_segments(keypoints: np.ndarray, parents: np.ndarray | None = None) -> Iterable[tuple[np.ndarray, np.ndarray]]:

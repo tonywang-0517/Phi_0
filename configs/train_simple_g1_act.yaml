@@ -1,0 +1,51 @@
+# @package _global_
+# Phi_0 ACT fine-tune on SIMPLE G1 whole-body (36-dim, Psi0 finetune-simple aligned).
+
+defaults:
+  - train_full
+  - data: simple_g1
+  - override /model: phi0_full
+  - _self_
+
+seed: 292285
+output_dir: ./experiments/simple_g1_act
+checkpoint_name: simple_g1_act
+max_steps: 40000
+save_every_steps: 10000
+checkpoint_overwrite: true
+auto_resume: true
+save_action_expert_only: true
+save_optimizer: false
+
+device: cuda
+batch_size: 16
+num_workers: 8
+prefetch_factor: 4
+repeated_action_steps: 1
+compile_action_expert: false
+learning_rate: 0.0
+learning_rate_backbone: 0.0
+learning_rate_action: 1.0e-4
+learning_rate_warmup_steps: 1000
+learning_rate_scheduler: cosine
+weight_decay: 1.0e-6
+adam_beta1: 0.95
+adam_beta2: 0.999
+
+model:
+  robot_action_dim: 36
+  robot_action_loss_type: l1
+  action_head: act
+  past_action_window_size: 1
+  freeze_vlm: true
+  vlm:
+    img_aug: true
+  vggt:
+    enabled: false
+  loss:
+    lambda_video: 0.0
+    lambda_action: 1.0
+    lambda_bone: 0.0
+    lambda_bone_hand: 0.0
+    lambda_bone_dir: 0.0
+    lambda_hand_mse: 0.0

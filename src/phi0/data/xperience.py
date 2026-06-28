@@ -1,4 +1,4 @@
-"""Xperience-10M sample loader → Phi_0 D_raw + masks."""
+"""Xperience HDF5 → unified action ground truth (D_UNIFIED=512) with FK validation."""
 
 from __future__ import annotations
 
@@ -13,7 +13,9 @@ from torch.utils.data import Dataset
 
 from phi0.data.video_cache import preload_mp4_frames
 from phi0.data.cosmos_video_size import DEFAULT_COSMOS_VIDEO_SIZE
+from phi0.data.xperience_unified_gt import pack_xperience_unified_frame_gt
 from phi0.schema.draw_schema import D_RAW, DrawLayout, pack_xperience_keypoints
+from phi0.schema.unified_action_schema import D_UNIFIED, dim_mask_for_dataset
 
 DEFAULT_HDF5 = Path(
     "/mnt/data2/wpy/workspace/Isaac-GR00T/demo_data/xperience-10m-sample/annotation.hdf5"
@@ -21,7 +23,6 @@ DEFAULT_HDF5 = Path(
 DEFAULT_VIDEO = Path(
     "/mnt/data2/wpy/workspace/Isaac-GR00T/demo_data/xperience-10m-sample/stereo_left.mp4"
 )
-# Fallback if demo lives on data1 mount
 if not DEFAULT_HDF5.exists():
     DEFAULT_HDF5 = Path(
         "/mnt/data1/wpy/workspace/Isaac-GR00T/demo_data/xperience-10m-sample/annotation.hdf5"
@@ -57,15 +58,26 @@ class XperienceDataset(Dataset):
         video_path: Optional[str | Path] = None,
         image_size: Tuple[int, int] = DEFAULT_COSMOS_VIDEO_SIZE,
         cache_video: bool = True,
+        *,
+        action_rep: str = "keypoints",
     ):
         self.hdf5_path = Path(hdf5_path)
         self.frame_stride = int(frame_stride)
         self.start_frame = int(start_frame)
         self.image_size = image_size
+        self.action_rep = str(action_rep).strip().lower()
         resolved = resolve_xperience_video_path(video_path)
         self.video_path = resolved
-        self.layout = DrawLayout()
-        self.action_dim_is_pad = self.layout.dim_mask_for_dataset(self.DATASET_NAME)
+
+        if self.action_rep == "unified":
+            self.action_dim = D_UNIFIED
+            self.action_dim_is_pad = ~dim_mask_for_dataset(self.DATASET_NAME)
+        elif self.action_rep == "keypoints":
+            self.layout = DrawLayout()
+            self.action_dim = D_RAW
+            self.action_dim_is_pad = ~self.layout.dim_mask_for_dataset(self.DATASET_NAME)
+        else:
+            raise ValueError(f"unknown action_rep {action_rep!r}; use 'keypoints' or 'unified'")
 
         with h5py.File(self.hdf5_path, "r") as f:
             self.n_total = int(f["full_body_mocap/body_quats"].shape[0])
@@ -94,12 +106,29 @@ class XperienceDataset(Dataset):
             self._h5 = h5py.File(self.hdf5_path, "r")
         return self._h5
 
-    def _load_frame_action(self, t: int) -> np.ndarray:
+    def _load_frame_action_keypoints(self, t: int) -> np.ndarray:
         f = self._get_h5()
         keypoints = f["full_body_mocap/keypoints"][t].astype(np.float32)
         betas = f["full_body_mocap/betas"][t].astype(np.float32)
         tactile = np.zeros(10, dtype=np.float32)
         return pack_xperience_keypoints(keypoints, betas, tactile)
+
+    def _load_frame_action_unified(self, t: int, *, state_t: int | None = None) -> Dict[str, Any]:
+        f = self._get_h5()
+        gt = pack_xperience_unified_frame_gt(f, t, state_t=state_t)
+        return {
+            "action": gt.action,
+            "frame_index": gt.frame_index,
+            "state_frame_index": gt.state_frame_index,
+            "state_root_trans_world": gt.state_root_trans_world,
+            "target_root_trans_world": gt.target_root_trans_world,
+            "betas": gt.betas,
+        }
+
+    def _load_frame_action(self, t: int, *, state_t: int | None = None) -> np.ndarray | Dict[str, Any]:
+        if self.action_rep == "unified":
+            return self._load_frame_action_unified(t, state_t=state_t)
+        return self._load_frame_action_keypoints(t)
 
     def _placeholder_image(self, t: int) -> torch.Tensor:
         h, w = self.image_size
@@ -131,8 +160,30 @@ class XperienceDataset(Dataset):
 
     def __getitem__(self, idx: int) -> Dict[str, Any]:
         t = self.frame_indices[idx]
-        action = self._load_frame_action(t)
+        loaded = self._load_frame_action(t, state_t=t)
         image, uses_real_video = self._load_image(t)
+
+        if self.action_rep == "unified":
+            action = loaded["action"]
+            out: Dict[str, Any] = {
+                "dataset": self.DATASET_NAME,
+                "idx": idx,
+                "frame_index": int(loaded["frame_index"]),
+                "state_frame_index": int(loaded["state_frame_index"]),
+                "task": self.task_text,
+                "uses_real_video": uses_real_video,
+                "images": {"ego_view": image.unsqueeze(0)},
+                "image_is_pad": torch.zeros(1, dtype=torch.bool),
+                "action": torch.from_numpy(action).unsqueeze(0),
+                "action_is_pad": torch.zeros(1, dtype=torch.bool),
+                "action_dim_is_pad": torch.from_numpy(self.action_dim_is_pad.copy()),
+                "state_root_trans_world": torch.from_numpy(loaded["state_root_trans_world"]),
+                "target_root_trans_world": torch.from_numpy(loaded["target_root_trans_world"]),
+                "betas": torch.from_numpy(loaded["betas"]),
+            }
+            return out
+
+        action = loaded
         return {
             "dataset": self.DATASET_NAME,
             "idx": idx,
@@ -143,7 +194,7 @@ class XperienceDataset(Dataset):
             "image_is_pad": torch.zeros(1, dtype=torch.bool),
             "action": torch.from_numpy(action).unsqueeze(0),
             "action_is_pad": torch.zeros(1, dtype=torch.bool),
-            "action_dim_is_pad": torch.from_numpy(~self.action_dim_is_pad),
+            "action_dim_is_pad": torch.from_numpy(self.action_dim_is_pad.copy()),
         }
 
     def __del__(self):
@@ -164,4 +215,11 @@ class XperienceDataset(Dataset):
             "ego_view": torch.stack([b["images"]["ego_view"] for b in batch]),
         }
         out["action"] = torch.stack([b["action"] for b in batch])
+        if "state_root_trans_world" in batch[0]:
+            out["frame_index"] = torch.tensor([b["frame_index"] for b in batch], dtype=torch.long)
+            out["state_root_trans_world"] = torch.stack([b["state_root_trans_world"] for b in batch])
+            out["target_root_trans_world"] = torch.stack(
+                [b["target_root_trans_world"] for b in batch]
+            )
+            out["betas"] = torch.stack([b["betas"] for b in batch])
         return out

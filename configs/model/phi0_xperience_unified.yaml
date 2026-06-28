@@ -1,0 +1,37 @@
+# Phi_0 model for Xperience unified 512-d action
+defaults:
+  - phi0_full
+  - _self_
+
+raw_action_dim: 512
+action_head: act
+action_context_mode: full_clip
+past_action_window_size: 1
+
+action_dit_config:
+  hidden_dim: 1024
+  ffn_dim: 4096
+  num_heads: 4
+  attn_head_dim: 128
+  num_layers: 4
+  text_dim: 512
+  freq_dim: 256
+  eps: 1.0e-06
+  use_gradient_checkpointing: false
+  interleave_self_attention: true
+  add_pos_embed: true
+
+action_fm:
+  noise_beta_alpha: 1.5
+  noise_beta_beta: 1.0
+  noise_s: 0.999
+  num_timestep_buckets: 1000
+  num_inference_timesteps: 10
+
+loss:
+  lambda_video: 0.0
+  lambda_action: 1.0
+  lambda_bone: 0.0
+  lambda_bone_hand: 0.0
+  lambda_bone_dir: 0.0
+  lambda_hand_mse: 0.0

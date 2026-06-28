@@ -37,7 +37,7 @@ def test_build_vlm_inputs_from_pixel_batch_dual_views():
 
     with patch(
         "phi0.models.vlm.preprocess.preprocess_frame_for_vlm",
-        side_effect=lambda frame, _transform: frame,
+        side_effect=lambda frame, _transform, **kwargs: frame,
     ) as mock_prep, patch(
         "phi0.models.vlm.preprocess.build_vlm_chat_inputs",
         return_value={"input_ids": torch.ones(2, 8)},

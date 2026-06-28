@@ -381,7 +381,7 @@ def random_baseline_eval(
             mask_pad = dim_pad
         else:
             batch = SequenceDataset.collate_fn([seq[clip_idx]])
-            mb = prepare_model_batch(model, processor, batch, prompt_cache=prompt_cache)
+            mb = prepare_model_batch(model, processor, batch)
             mb = {k: (v.to(model.device) if torch.is_tensor(v) else v) for k, v in mb.items()}
             _, target, token_pad, dim_pad = model._action_proprio_future(
                 mb["action"], mb.get("action_is_pad"), mb.get("action_dim_is_pad")
@@ -604,7 +604,7 @@ def deploy_fm_eval(
     }
     seq = sequence_dataset_from_cfg(mixed, align_cfg)
     clip_idx = min(start_frame, len(seq) - 1)
-    clip_batch = prepare_model_batch(model, processor, SequenceDataset.collate_fn([seq[clip_idx]]), prompt_cache=prompt_cache)
+    clip_batch = prepare_model_batch(model, processor, SequenceDataset.collate_fn([seq[clip_idx]]))
     clip_batch = {k: (v.to(model.device) if torch.is_tensor(v) else v) for k, v in clip_batch.items()}
     deploy_aligned_fm = clip_hook_eval(model, processor, clip_batch)
 

@@ -81,6 +81,7 @@ class ClipInputsCache:
         *,
         prompt_cache: Optional[VLMContextCache] = None,
         cache_action_context: bool = True,
+        collate_fn=None,
     ) -> Dict[str, Any]:
         if clip_idx in self._store:
             self.hits += 1
@@ -89,9 +90,12 @@ class ClipInputsCache:
         from phi0.data.sequence import SequenceDataset
         from phi0.runtime import prepare_model_batch
 
+        if collate_fn is None:
+            collate_fn = SequenceDataset.collate_fn
+
         self.misses += 1
-        batch = SequenceDataset.collate_fn([seq_dataset[clip_idx]])
-        mb = prepare_model_batch(model, processor, batch, prompt_cache=prompt_cache)
+        batch = collate_fn([seq_dataset[clip_idx]])
+        mb = prepare_model_batch(model, processor, batch)
         mb = {k: (v.to(model.device) if torch.is_tensor(v) else v) for k, v in mb.items()}
         inputs = model.build_inputs(mb)
         if cache_action_context and "action_ctx" not in inputs:

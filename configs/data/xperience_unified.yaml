@@ -1,0 +1,19 @@
+# Xperience unified SMPL-H action (512-d token, 346 semantic dims)
+# @package data
+
+dataset: xperience_unified
+xperience_action_rep: unified
+xperience_only: true
+action_dim: 512
+seq_len: 4
+control_fps: 20.0
+action_video_freq_ratio: 2
+dataset_native_fps:
+  xperience: 20.0
+xperience_max_frames: 256
+egodex_max_frames: 0
+xperience_video: null
+cache_video: true
+normalize: true
+mono_camera: true
+action_norm_mode: z-score

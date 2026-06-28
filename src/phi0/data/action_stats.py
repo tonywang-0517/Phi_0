@@ -23,8 +23,93 @@ from phi0.data.robot_action_norm import (
     validate_stats_for_cfg,
 )
 from phi0.schema.draw_schema import D_RAW
+from phi0.schema.unified_action_schema import D_UNIFIED, dim_mask_for_dataset
 
 logger = logging.getLogger(__name__)
+
+
+def masked_unified_action_stats(
+    acts: np.ndarray,
+    *,
+    supervised_mask: np.ndarray | None = None,
+) -> dict[str, list[float] | list[int]]:
+    """Per-dim min/max/mean/std; unsupervised dims stay mean=0, std=1."""
+    acts = np.asarray(acts, dtype=np.float64)
+    if acts.ndim != 2 or acts.shape[1] != D_UNIFIED:
+        raise ValueError(f"expected acts (T, {D_UNIFIED}), got {acts.shape}")
+    mask = (
+        np.asarray(supervised_mask, dtype=bool).reshape(D_UNIFIED)
+        if supervised_mask is not None
+        else dim_mask_for_dataset("g1_sonic")
+    )
+    n = int(acts.shape[0])
+    mean = np.zeros(D_UNIFIED, dtype=np.float64)
+    std = np.ones(D_UNIFIED, dtype=np.float64)
+    act_min = np.zeros(D_UNIFIED, dtype=np.float64)
+    act_max = np.zeros(D_UNIFIED, dtype=np.float64)
+    for j in np.flatnonzero(mask):
+        col = acts[:, j]
+        mean[j] = col.mean()
+        std[j] = max(float(col.std(ddof=0)), 1e-12)
+        act_min[j] = col.min()
+        act_max[j] = col.max()
+    std[mask & (std < 0.01)] = 1.0
+    return {
+        "min": act_min.tolist(),
+        "max": act_max.tolist(),
+        "mean": mean.tolist(),
+        "std": std.tolist(),
+        "count": [n],
+    }
+
+
+def merge_masked_unified_action_stats(
+    episode_stats: Sequence[dict[str, Any]],
+    *,
+    supervised_mask: np.ndarray | None = None,
+) -> dict[str, list[float]] | None:
+    """Merge per-episode masked stats; unsupervised dims stay mean=0, std=1."""
+    mask = (
+        np.asarray(supervised_mask, dtype=bool).reshape(D_UNIFIED)
+        if supervised_mask is not None
+        else dim_mask_for_dataset("g1_sonic")
+    )
+    act_sum = np.zeros(D_UNIFIED, dtype=np.float64)
+    act_sq = np.zeros(D_UNIFIED, dtype=np.float64)
+    act_min = np.full(D_UNIFIED, np.inf)
+    act_max = np.full(D_UNIFIED, -np.inf)
+    total = 0
+    for stats in episode_stats:
+        ua = stats["unified_action"]
+        count = int(ua["count"][0])
+        mean = np.asarray(ua["mean"], dtype=np.float64)
+        std = np.asarray(ua["std"], dtype=np.float64)
+        for j in np.flatnonzero(mask):
+            act_sum[j] += mean[j] * count
+            act_sq[j] += (std[j] ** 2 + mean[j] ** 2) * count
+            act_min[j] = min(act_min[j], float(ua["min"][j]))
+            act_max[j] = max(act_max[j], float(ua["max"][j]))
+        total += count
+    if total <= 0:
+        return None
+    act_mean = np.zeros(D_UNIFIED, dtype=np.float64)
+    act_std = np.ones(D_UNIFIED, dtype=np.float64)
+    act_min_out = np.zeros(D_UNIFIED, dtype=np.float64)
+    act_max_out = np.zeros(D_UNIFIED, dtype=np.float64)
+    for j in np.flatnonzero(mask):
+        act_mean[j] = act_sum[j] / total
+        act_std[j] = float(np.sqrt(max(act_sq[j] / total - act_mean[j] ** 2, 1e-12)))
+        act_min_out[j] = act_min[j]
+        act_max_out[j] = act_max[j]
+    act_std[mask & (act_std < 0.01)] = 1.0
+    return {
+        "mean": act_mean.tolist(),
+        "std": act_std.tolist(),
+        "q01": act_min_out.tolist(),
+        "q99": act_max_out.tolist(),
+        "min": act_min_out.tolist(),
+        "max": act_max_out.tolist(),
+    }
 
 
 def _frame_action_vector(item: dict, *, field: Optional[str] = None) -> tuple[np.ndarray, np.ndarray]:
@@ -156,19 +241,20 @@ def compute_action_stats_from_datasets(
     normalize_gripper: bool = True,
     stats_field: Optional[str] = None,
     show_progress: bool = False,
+    action_dim: int = D_RAW,
 ) -> Dict[str, Any]:
     """Scan frame-level datasets and return per-dim stats for supervised dims."""
-    count = np.zeros(D_RAW, dtype=np.int64)
-    mean = np.zeros(D_RAW, dtype=np.float64)
-    m2 = np.zeros(D_RAW, dtype=np.float64)
-    percentile_buckets: List[List[float]] = [[] for _ in range(D_RAW)]
+    count = np.zeros(action_dim, dtype=np.int64)
+    mean = np.zeros(action_dim, dtype=np.float64)
+    m2 = np.zeros(action_dim, dtype=np.float64)
+    percentile_buckets: List[List[float]] = [[] for _ in range(action_dim)]
     n_frames = 0
     norm_key = str(norm_mode).strip().lower()
 
     for x, valid in _iter_dataset_frames(datasets, field=stats_field, show_progress=show_progress):
         _online_update(x, valid, count, mean, m2)
         if norm_key == "bounds_q99":
-            for j in range(D_RAW):
+            for j in range(action_dim):
                 if valid[j]:
                     percentile_buckets[j].append(float(x[j]))
         n_frames += 1
@@ -183,7 +269,7 @@ def compute_action_stats_from_datasets(
     q01 = mean.copy()
     q99 = mean.copy()
     if norm_key == "bounds_q99":
-        for j in range(D_RAW):
+        for j in range(action_dim):
             if percentile_buckets[j]:
                 arr = np.asarray(percentile_buckets[j], dtype=np.float64)
                 q01[j] = float(np.percentile(arr, 1))
@@ -193,7 +279,7 @@ def compute_action_stats_from_datasets(
 
     supervised = (~unsupervised).tolist()
     if not normalize_gripper:
-        for j in range(min(ROBOT_DIM, D_RAW)):
+        for j in range(min(ROBOT_DIM, action_dim)):
             if j == GRIPPER_DIM:
                 supervised[j] = False
 
@@ -207,6 +293,7 @@ def compute_action_stats_from_datasets(
         num_frames=n_frames,
         normalize_gripper=normalize_gripper,
         supervised_mask=supervised,
+        action_dim=action_dim,
     )
 
 
@@ -230,6 +317,9 @@ def compute_action_stats_for_data_cfg(
         norm_mode = str(data_cfg.get("action_norm_mode", "z-score")).strip().lower()
         normalize_gripper = True
         stats_field = None
+    action_dim = int(data_cfg.get("action_dim", 0)) or (
+        D_UNIFIED if str(data_cfg.get("xperience_action_rep", "keypoints")).lower() == "unified" else D_RAW
+    )
     return compute_action_stats_from_datasets(
         datasets,
         robot_action_semantics=semantics,
@@ -237,6 +327,7 @@ def compute_action_stats_for_data_cfg(
         normalize_gripper=normalize_gripper,
         stats_field=stats_field,
         show_progress=show_progress,
+        action_dim=action_dim,
     )
 
 

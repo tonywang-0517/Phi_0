@@ -135,10 +135,11 @@ class Phi0(torch.nn.Module):
             if self.action_head == "fm"
             else None
         )
-        self.register_buffer("action_norm_mean", torch.zeros(D_RAW), persistent=False)
-        self.register_buffer("action_norm_std", torch.ones(D_RAW), persistent=False)
-        self.register_buffer("action_norm_q01", torch.zeros(D_RAW), persistent=False)
-        self.register_buffer("action_norm_q99", torch.ones(D_RAW), persistent=False)
+        _norm_dim = int(getattr(action_expert, "raw_action_dim", D_RAW))
+        self.register_buffer("action_norm_mean", torch.zeros(_norm_dim), persistent=False)
+        self.register_buffer("action_norm_std", torch.ones(_norm_dim), persistent=False)
+        self.register_buffer("action_norm_q01", torch.zeros(_norm_dim), persistent=False)
+        self.register_buffer("action_norm_q99", torch.ones(_norm_dim), persistent=False)
         self.action_norm_mode: str = "z-score"
         self.action_normalize_gripper: bool = True
         self.robot_action_loss_type: str = "mse"
@@ -165,16 +166,25 @@ class Phi0(torch.nn.Module):
         norm_mode: str = "z-score",
         normalize_gripper: bool = True,
     ) -> None:
-        self.action_norm_mean.copy_(mean.to(dtype=torch.float32).view(-1))
-        self.action_norm_std.copy_(std.to(dtype=torch.float32).view(-1).clamp(min=1e-6))
+        mean = mean.to(dtype=torch.float32).view(-1)
+        std = std.to(dtype=torch.float32).view(-1).clamp(min=1e-6)
+        n = mean.numel()
+        if n > self.action_norm_mean.numel():
+            raise ValueError(
+                f"Stats dim {n} exceeds action_norm buffer {self.action_norm_mean.numel()}"
+            )
+        self.action_norm_mean[:n].copy_(mean)
+        self.action_norm_std[:n].copy_(std)
         if q01 is not None:
-            self.action_norm_q01.copy_(q01.to(dtype=torch.float32).view(-1))
+            q01_t = q01.to(dtype=torch.float32).view(-1)
+            self.action_norm_q01[:n].copy_(q01_t)
         else:
-            self.action_norm_q01.copy_(self.action_norm_mean)
+            self.action_norm_q01[:n].copy_(self.action_norm_mean[:n])
         if q99 is not None:
-            self.action_norm_q99.copy_(q99.to(dtype=torch.float32).view(-1))
+            q99_t = q99.to(dtype=torch.float32).view(-1)
+            self.action_norm_q99[:n].copy_(q99_t)
         else:
-            self.action_norm_q99.copy_(self.action_norm_mean)
+            self.action_norm_q99[:n].copy_(self.action_norm_mean[:n])
         self.action_norm_mode = str(norm_mode).strip().lower()
         self.action_normalize_gripper = bool(normalize_gripper)
 
@@ -454,6 +464,17 @@ class Phi0(torch.nn.Module):
         from phi0.data.robot_action_norm import ROBOT_DIM
 
         return int(getattr(self.action_expert, "raw_action_dim", D_RAW)) == ROBOT_DIM
+
+    def uses_robot_lowdim_action(self) -> bool:
+        """LIBERO 7D or SIMPLE G1 36D low-dimensional robot controls."""
+        raw_dim = int(getattr(self.action_expert, "raw_action_dim", D_RAW))
+        if raw_dim == D_RAW:
+            return False
+        from phi0.data.robot_action_norm import ROBOT_DIM
+        from phi0.data.simple_action_norm import SIMPLE_G1_DIM
+        from phi0.data.sonic_action_norm import SONIC_ACTION_DIM
+
+        return raw_dim in {ROBOT_DIM, SIMPLE_G1_DIM, SONIC_ACTION_DIM}
 
     def _embed_action_contexts(
         self,
@@ -862,7 +883,11 @@ class Phi0(torch.nn.Module):
 
                     or inputs.get("robot_future_delta_7d") is not None
 
-                ) and self.uses_robot7d_action():
+                    or inputs.get("robot_future_36d") is not None
+
+                    or inputs.get("robot_future_100d") is not None
+
+                ) and self.uses_robot_lowdim_action():
 
                     loss_action = self._compute_robot_action_decoder_loss(
 

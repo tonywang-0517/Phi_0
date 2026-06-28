@@ -7,6 +7,7 @@ from typing import Any, Dict, List, Mapping, Optional
 import torch
 from torch.utils.data import Dataset
 
+from phi0.data.xperience_unified_gt import repack_clip_root_trans_local
 from phi0.data.temporal_align import (
     DEFAULT_DATASET_NATIVE_FPS,
     max_native_span_frames,
@@ -75,6 +76,14 @@ class SequenceDataset(Dataset):
                 end = offset + len(ds)
                 ranges.append((offset, end))
                 offset = end
+            return ranges
+        episode_cumulative = getattr(base, "episode_cumulative", None)
+        if episode_cumulative:
+            ranges = []
+            start = 0
+            for end in episode_cumulative:
+                ranges.append((start, end))
+                start = end
             return ranges
         return [(0, len(base))]
 
@@ -186,6 +195,16 @@ class SequenceDataset(Dataset):
                 wrist_ctrl = resample_image_sequence(wrist, src_len, seq_len_eff)
                 wrist_out = wrist_ctrl[video_idx]
         action_ctrl = resample_action_sequence(actions, src_len, seq_len_eff)
+        if "target_root_trans_world" in native_frames[0]:
+            roots_native = torch.stack(
+                [f["target_root_trans_world"] for f in native_frames], dim=0
+            ).numpy()
+            repacked = repack_clip_root_trans_local(
+                action_ctrl.numpy(),
+                roots_native,
+                anchor_index=0,
+            )
+            action_ctrl = torch.from_numpy(repacked)
         robot_ctrl = None
         if robot_actions is not None:
             robot_ctrl = resample_action_sequence(robot_actions, src_len, seq_len_eff)
