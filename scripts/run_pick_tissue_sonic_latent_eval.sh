@@ -9,13 +9,15 @@ VENV_SIM="${GR00T_ROOT}/.venv_sim"
 DEPLOY="${GR00T_ROOT}/gear_sonic_deploy"
 ROBOT_MOTION="${ROBOT_MOTION:-${GR00T_ROOT}/sample_data/robot_filtered/210531/walk_forward_amateur_001__A001.pkl}"
 WORK_DIR="${WORK_DIR:-${PHI0_ROOT}/../logs/pick_tissue_finetune/sonic_latent_$([ -n "${CHECKPOINT:-}" ] && echo model || echo gt)_$(date +%Y%m%d_%H%M%S)}"
+mkdir -p "${WORK_DIR}"
+WORK_DIR="$(cd "${WORK_DIR}" && pwd)"
 LOG_DIR="${WORK_DIR}/logs"
 mkdir -p "${LOG_DIR}"
 
 PHI0_PY="${PHI0_PY:-/mnt/data/miniconda3/envs/Phi-0-wpy/bin/python}"
 VALID_ROOT="${VALID_ROOT:-${PHI0_ROOT}/../Isaac-GR00T/data/pick_tissue_valid}"
 UNIFIED_ROOT="${UNIFIED_ROOT:-${PHI0_ROOT}/../Isaac-GR00T/data/pick_tissue_xperience_unified}"
-MANIFEST_PATH="${MANIFEST_PATH:-${PHI0_ROOT}/../Isaac-GR00T/data/data.json}"
+MANIFEST_PATH="${MANIFEST_PATH:-${PHI0_ROOT}/../Isaac-GR00T/data/pick_tissues.json}"
 TOKEN_SOURCE="${TOKEN_SOURCE:-unified_slice}"
 CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-4}"
 RECORD_FPS="${RECORD_FPS:-30}"
@@ -39,6 +41,7 @@ export CUDA_HOME="${CUDA_HOME:-/usr/local/cuda-12.8}"
 export LD_LIBRARY_PATH="${TensorRT_ROOT}/lib:${onnxruntime_ROOT}/lib:${LD_LIBRARY_PATH:-}"
 SIM_WARMUP_S="${SIM_WARMUP_S:-10}"
 DEPLOY_INIT_TIMEOUT_S="${DEPLOY_INIT_TIMEOUT_S:-300}"
+REPLAY_READY_TIMEOUT_S="${REPLAY_READY_TIMEOUT_S:-900}"
 
 # Resolve episode parquets (manifest ep2 -> unified idx 447, valid src ep524)
 UNIFIED_EP="${UNIFIED_EP:-}"
@@ -140,6 +143,23 @@ require_pid() {
   exit 1
 }
 
+require_replay() {
+  require_pid "${REPLAY_PID}" "model publisher" "${LOG_DIR}/replay.log"
+  if grep -qE "Traceback \(most recent call last\)" "${LOG_DIR}/replay.log" 2>/dev/null; then
+    log_step "model publisher crashed"
+    tail -30 "${LOG_DIR}/replay.log"
+    exit 1
+  fi
+}
+
+_fall_count() {
+  local n=0
+  if [[ -f "$1" ]]; then
+    n=$(grep -cF '[sim_health] FALL' "$1" 2>/dev/null) || n=0
+  fi
+  echo "${n}"
+}
+
 cleanup() {
   for pid in "${REPLAY_PID}" "${DEPLOY_PID}" "${SIM_PID}"; do
     [[ -n "${pid}" ]] && kill -0 "${pid}" 2>/dev/null && kill "${pid}" 2>/dev/null || true
@@ -186,30 +206,41 @@ done
 sleep 2
 rm -f "${RECORD_START}" "${RECORD_STOP}" "${ARM_FLAG}" "${REPLAY_READY}"
 
-PRECOMPUTE_NPZ="${WORK_DIR}/sonic_latent_precompute.npz"
+PRECOMPUTE_NPZ="${PRECOMPUTE_IN:-${WORK_DIR}/sonic_latent_precompute.npz}"
+USE_PRECOMPUTE_NPZ=0
 if [[ -n "${CHECKPOINT}" ]]; then
-  if [[ "${SKIP_PRECOMPUTE:-}" != "1" ]] && { [[ ! -f "${PRECOMPUTE_NPZ}" ]] || [[ "${FORCE_PRECOMPUTE:-}" == "1" ]]; }; then
-    log_step "phase 1: offline model precompute -> ${PRECOMPUTE_NPZ} (lazy GT LUT, no sim/deploy)"
-    (
-      cd "${PHI0_ROOT}"
-      "${PHI0_PY}" "${PHI0_ROOT}/scripts/phi0_sonic_latent_zmq_publisher.py" \
-        --checkpoint "${CHECKPOINT}" \
-        --config-name "${CONFIG_NAME}" \
-        --episode-idx "${UNIFIED_EP}" \
-        --control-fps "${CONTROL_FPS}" \
-        --motion-seconds "${MOTION_SECONDS}" \
-        --max-frames "${MAX_FRAMES}" \
-        --precompute-out "${PRECOMPUTE_NPZ}"
-    ) > "${LOG_DIR}/precompute.log" 2>&1 || {
-      log_step "precompute failed"
-      tail -40 "${LOG_DIR}/precompute.log"
+  if [[ "${FORCE_PRECOMPUTE:-}" == "1" ]]; then
+    if [[ ! -f "${PRECOMPUTE_NPZ}" ]]; then
+      log_step "optional offline precompute -> ${PRECOMPUTE_NPZ} (set FORCE_PRECOMPUTE=0 for inline infer)"
+      (
+        cd "${PHI0_ROOT}"
+        "${PHI0_PY}" "${PHI0_ROOT}/scripts/phi0_sonic_latent_zmq_publisher.py" \
+          --checkpoint "${CHECKPOINT}" \
+          --config-name "${CONFIG_NAME}" \
+          --episode-idx "${UNIFIED_EP}" \
+          --control-fps "${CONTROL_FPS}" \
+          --motion-seconds "${MOTION_SECONDS}" \
+          --max-frames "${MAX_FRAMES}" \
+          --precompute-out "${PRECOMPUTE_NPZ}"
+      ) > "${LOG_DIR}/precompute.log" 2>&1 || {
+        log_step "precompute failed"
+        tail -40 "${LOG_DIR}/precompute.log"
+        exit 1
+      }
+      log_step "precompute done ($(wc -l < "${LOG_DIR}/precompute.log" | tr -d ' ') log lines)"
+    else
+      log_step "reusing precompute ${PRECOMPUTE_NPZ}"
+    fi
+    USE_PRECOMPUTE_NPZ=1
+  elif [[ -n "${PRECOMPUTE_IN:-}" ]]; then
+    if [[ ! -f "${PRECOMPUTE_NPZ}" ]]; then
+      log_step "ERROR: PRECOMPUTE_IN=${PRECOMPUTE_IN} not found"
       exit 1
-    }
-    log_step "precompute done ($(wc -l < "${LOG_DIR}/precompute.log" | tr -d ' ') log lines)"
-  elif [[ -f "${PRECOMPUTE_NPZ}" ]]; then
-    log_step "reusing precompute ${PRECOMPUTE_NPZ}"
+    fi
+    log_step "reuse precompute ${PRECOMPUTE_NPZ}"
+    USE_PRECOMPUTE_NPZ=1
   else
-    log_step "SKIP_PRECOMPUTE=1 and no ${PRECOMPUTE_NPZ}; publisher will load VLM inline"
+    log_step "inline infer at publisher (dataset clip + VLM, no offline precompute)"
   fi
 fi
 
@@ -256,7 +287,7 @@ done
 
 # 2) ZMQ v4 publisher: arm_flag -> command start; replay_go -> pose stream
 if [[ -n "${CHECKPOINT}" ]]; then
-  log_step "starting Phi-0 model publisher (precomputed stream)..."
+  log_step "starting Phi-0 model publisher..."
   PUBLISHER_ARGS=(
     --config-name "${CONFIG_NAME}"
     --episode-idx "${UNIFIED_EP}"
@@ -267,8 +298,9 @@ if [[ -n "${CHECKPOINT}" ]]; then
     --start-delay-s 0.5
     --arm-flag "${ARM_FLAG}"
     --ready-flag "${REPLAY_READY}"
+    --ready-timeout-s "${REPLAY_READY_TIMEOUT_S}"
   )
-  if [[ -f "${PRECOMPUTE_NPZ}" ]]; then
+  if [[ "${USE_PRECOMPUTE_NPZ}" == "1" ]]; then
     PUBLISHER_ARGS=(--precompute-in "${PRECOMPUTE_NPZ}" "${PUBLISHER_ARGS[@]}")
   else
     PUBLISHER_ARGS=(--checkpoint "${CHECKPOINT}" "${PUBLISHER_ARGS[@]}")
@@ -298,7 +330,7 @@ log_step "replay pid=${REPLAY_PID} log=${LOG_DIR}/replay.log"
 if [[ -n "${CHECKPOINT}" ]]; then
   # Precomputed path binds tcp in ~1s; inline VLM+inference may take minutes.
   wait_timeout=600
-  if [[ -f "${PRECOMPUTE_NPZ}" ]]; then
+  if [[ "${USE_PRECOMPUTE_NPZ}" == "1" ]]; then
     wait_timeout=60
   fi
   for i in $(seq 1 "${wait_timeout}"); do
@@ -374,12 +406,14 @@ if ! wait_log "${LOG_DIR}/sim.log" "deploy lowcmd active" 120 "deploy lowcmd"; t
   tail -30 "${LOG_DIR}/sim.log"
   exit 1
 fi
+require_replay
 log_step "wait sim stable (no new FALL for ${RECORD_STABLE_S}s)..."
 stable_deadline=$(( $(date +%s) + 90 ))
 while (( $(date +%s) < stable_deadline )); do
-  fall_count="$(grep -c '\[sim_health\] FALL' "${LOG_DIR}/sim.log" 2>/dev/null || echo 0)"
+  require_replay
+  fall_count="$(_fall_count "${LOG_DIR}/sim.log")"
   sleep "${RECORD_STABLE_S}"
-  fall_after="$(grep -c '\[sim_health\] FALL' "${LOG_DIR}/sim.log" 2>/dev/null || echo 0)"
+  fall_after="$(_fall_count "${LOG_DIR}/sim.log")"
   if [[ "${fall_after}" -le "${fall_count}" ]]; then
     log_step "sim stable (${RECORD_STABLE_S}s without new FALL, total_fall=${fall_after})"
     break
@@ -390,11 +424,14 @@ log_step "settle ${RECORD_SETTLE_S}s after deploy active before record..."
 sleep "${RECORD_SETTLE_S}"
 
 touch "${RECORD_START}"
-if ! wait_log "${LOG_DIR}/sim.log" "sim_record] started" 30 "sim record start"; then
+if ! wait_log "${LOG_DIR}/sim.log" "sim_record] started" 60 "sim record start"; then
+  log_step "record flag paths: start=${RECORD_START} stop=${RECORD_STOP}"
+  ls -la "${RECORD_START}" "${REPLAY_READY}" 2>&1 || true
   tail -20 "${LOG_DIR}/sim.log"; exit 1
 fi
 touch "${REPLAY_READY}"
 log_step "recording + streaming ${MAX_FRAMES} frames @ ${CONTROL_FPS}Hz..."
+require_replay
 
 wait "${REPLAY_PID}" || true
 sleep 1

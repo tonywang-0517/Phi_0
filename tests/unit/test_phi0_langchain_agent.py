@@ -6,8 +6,15 @@ import ast
 from pathlib import Path
 
 from phi0.agent.checkpoints import DEFAULT_SKILL_CHECKPOINTS, resolve_skill_checkpoint
-from phi0.agent.prompts import ROBOT_SYSTEM_PROMPT_ZH, build_agent_user_turn
-from phi0.agent.qwen_vl_chat import _parse_tool_calls, _strip_tool_markup
+from phi0.agent.prompts import (
+    ROBOT_SYSTEM_PROMPT_ZH,
+    build_agent_user_turn,
+)
+from phi0.agent.qwen_vl_chat import (
+    _langchain_messages_to_qwen_conversation,
+    _parse_tool_calls,
+    _strip_tool_markup,
+)
 from phi0.agent.robot_agent import _output_without_follow_up
 from langchain_core.messages import AIMessage
 
@@ -16,6 +23,36 @@ def test_system_prompt_lists_three_skills():
     assert "pick_tissues" in ROBOT_SYSTEM_PROMPT_ZH
     assert "throw_rubbish" in ROBOT_SYSTEM_PROMPT_ZH
     assert "stay" in ROBOT_SYSTEM_PROMPT_ZH
+    assert "<tool_call>" in ROBOT_SYSTEM_PROMPT_ZH
+
+
+def test_user_turn_reminds_tool_call():
+    text = build_agent_user_turn("拿纸巾", has_wrist_image=True)
+    assert "左腕" in text
+    assert "<tool_call>" in text
+
+
+def test_langchain_messages_use_system_role():
+    from langchain_core.messages import HumanMessage, SystemMessage
+    from PIL import Image
+
+    img = Image.new("RGB", (4, 4))
+    conv = _langchain_messages_to_qwen_conversation(
+        [
+            SystemMessage(content="sys"),
+            HumanMessage(
+                content=[
+                    {"type": "image", "image": img},
+                    {"type": "text", "text": "hi"},
+                ]
+            ),
+        ]
+    )
+    assert conv[0]["role"] == "system"
+    assert conv[1]["role"] == "user"
+    user_content = conv[1]["content"]
+    assert any(b.get("type") == "image" for b in user_content)
+    assert any(b.get("type") == "text" and "hi" in b.get("text", "") for b in user_content)
 
 
 def test_throw_rubbish_fallback_to_pick_ckpt():

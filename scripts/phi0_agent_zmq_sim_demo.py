@@ -42,6 +42,12 @@ def parse_args():
     p.add_argument("--device", type=str, default="cuda")
     p.add_argument("--motion-seconds", type=float, default=8.0)
     p.add_argument("--out-dir", type=str, default="")
+    p.add_argument(
+        "--precompute-in",
+        type=str,
+        default="",
+        help="Optional: reuse saved npz (default = inline VLM infer at publisher)",
+    )
     p.add_argument("--skip-agent", action="store_true", help="Force skill (with --force-skill)")
     p.add_argument(
         "--force-skill",
@@ -50,6 +56,16 @@ def parse_args():
         choices=["", "pick_tissues", "throw_rubbish", "stay"],
     )
     return p.parse_args()
+
+
+def _resolve_precompute_in(explicit: str) -> Path | None:
+    """Only use npz when user explicitly passes --precompute-in / PRECOMPUTE_IN."""
+    if not explicit.strip():
+        return None
+    path = Path(explicit).expanduser().resolve()
+    if not path.is_file():
+        raise FileNotFoundError(f"--precompute-in not found: {path}")
+    return path
 
 
 def _run_sonic_sim(
@@ -61,6 +77,7 @@ def _run_sonic_sim(
     config_name: str,
     motion_seconds: float,
     out_dir: Path,
+    precompute_in: str = "",
 ) -> Path:
     from phi0.agent.checkpoints import DEFAULT_SKILL_CHECKPOINTS, resolve_skill_checkpoint
 
@@ -86,6 +103,12 @@ def _run_sonic_sim(
             "ENABLE_G1_DEBUG_OVERLAY": env.get("ENABLE_G1_DEBUG_OVERLAY", "0"),
         }
     )
+    pc = _resolve_precompute_in(precompute_in)
+    if pc is not None:
+        env["PRECOMPUTE_IN"] = str(pc)
+        logger.info("reuse precompute %s", pc)
+    else:
+        logger.info("SONIC publisher will inline-infer (no precompute npz)")
     script = ROOT / "scripts/run_pick_tissue_sonic_latent_eval.sh"
     logger.info("launch SONIC sim skill=%s ckpt=%s ep=%d", skill, ckpt, episode_idx)
     subprocess.run(["bash", str(script)], check=True, env=env, cwd=str(ROOT))
@@ -106,6 +129,7 @@ def main():
 
     ts = __import__("datetime").datetime.now().strftime("%Y%m%d_%H%M%S")
     out_dir = Path(args.out_dir) if args.out_dir else WORKSPACE / "logs" / f"agent_sonic_sim_{ts}"
+    out_dir = out_dir.expanduser().resolve()
     out_dir.mkdir(parents=True, exist_ok=True)
 
     skill: str | None = None
@@ -129,11 +153,13 @@ def main():
         )
         agent_result = agent.run(args.user_instruction, ego, wrist_image=wrist)
         skill = agent_result.get("selected_skill")
-        if skill is None and any(k in args.user_instruction for k in ("纸巾", "tissue", "捡", "拿")):
-            logger.warning("agent did not call a tool; demo fallback -> pick_tissues")
-            skill = "pick_tissues"
-            agent_result["selected_skill"] = skill
-            agent_result.setdefault("output", "好的，我来帮你拿纸巾。")
+        if skill is None and agent_result.get("tool_steps"):
+            logger.warning(
+                "agent called %d tools; only single-tool actions drive Phi0",
+                len(agent_result["tool_steps"]),
+            )
+        elif skill is None:
+            logger.warning("agent did not call any tool -> skip Phi0 / SONIC")
 
     (out_dir / "agent_result.json").write_text(
         json.dumps(agent_result, ensure_ascii=False, indent=2, default=str),
@@ -142,9 +168,14 @@ def main():
     print("=== Agent ===")
     print(agent_result.get("output", ""))
     print("selected_skill:", skill)
+    if agent_result.get("tool_steps"):
+        print("tool_steps:", json.dumps(agent_result["tool_steps"], ensure_ascii=False, default=str))
 
     if skill not in ACTION_SKILLS:
-        print(f"stay / no action skill -> skip SONIC sim (out_dir={out_dir})")
+        if skill is None:
+            print("agent 未选出可执行技能 -> 不启动 Phi0 / SONIC")
+        else:
+            print(f"skill={skill!r} -> skip SONIC sim (out_dir={out_dir})")
         return
 
     mp4 = _run_sonic_sim(
@@ -155,6 +186,7 @@ def main():
         config_name=args.config_name,
         motion_seconds=float(args.motion_seconds),
         out_dir=out_dir,
+        precompute_in=args.precompute_in,
     )
     print(f"[done] video={mp4}")
 

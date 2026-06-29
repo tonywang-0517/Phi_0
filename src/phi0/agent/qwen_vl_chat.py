@@ -19,6 +19,11 @@ from pydantic import Field
 from phi0.models.vlm.preprocess import build_qwenvl_inputs_single
 from phi0.models.vlm.tower import GenerateTextConfig, Qwen3VLTower, load_agent_speech_tower
 
+try:
+    from qwen_vl_utils import process_vision_info
+except ImportError:  # pragma: no cover
+    process_vision_info = None  # type: ignore[assignment]
+
 
 def _message_content_to_parts(content: Any) -> tuple[list[Any], str]:
     """Extract PIL images and text from LangChain message content."""
@@ -52,32 +57,49 @@ def _message_content_to_parts(content: Any) -> tuple[list[Any], str]:
     return images, "\n".join(p for p in text_parts if p).strip()
 
 
-def _langchain_messages_to_qwen(
+def _langchain_messages_to_qwen_conversation(
     messages: Sequence[BaseMessage],
-) -> tuple[list[dict[str, Any]], list[Any]]:
-    """Flatten LangChain history into one user multimodal turn (ponytail: single-turn agent)."""
+) -> list[dict[str, Any]]:
+    """Map LangChain history to Qwen chat roles (system / user / assistant)."""
     system_texts: list[str] = []
-    images: list[Any] = []
-    user_texts: list[str] = []
+    conversation: list[dict[str, Any]] = []
+    pending_images: list[Any] = []
+    pending_texts: list[str] = []
+
+    def flush_user() -> None:
+        nonlocal pending_images, pending_texts
+        if not pending_images and not pending_texts:
+            return
+        content: list[dict[str, Any]] = [
+            {"type": "image", "image": img} for img in pending_images
+        ]
+        if pending_texts:
+            content.append({"type": "text", "text": "\n\n".join(pending_texts)})
+        conversation.append({"role": "user", "content": content})
+        pending_images = []
+        pending_texts = []
+
     for msg in messages:
         if isinstance(msg, SystemMessage):
             system_texts.append(str(msg.content))
         elif isinstance(msg, HumanMessage):
             imgs, txt = _message_content_to_parts(msg.content)
-            images.extend(imgs)
+            if pending_images or pending_texts:
+                flush_user()
+            pending_images.extend(imgs)
             if txt:
-                user_texts.append(txt)
+                pending_texts.append(txt)
         elif isinstance(msg, AIMessage):
-            user_texts.append(f"[assistant]\n{msg.content}")
+            flush_user()
+            conversation.append({"role": "assistant", "content": str(msg.content or "")})
         elif isinstance(msg, ToolMessage):
-            user_texts.append(f"[tool:{msg.name}]\n{msg.content}")
-    prompt_lines = []
+            flush_user()
+            pending_texts.append(f"[tool:{msg.name}]\n{msg.content}")
+    flush_user()
+
     if system_texts:
-        prompt_lines.append("\n".join(system_texts))
-    if user_texts:
-        prompt_lines.append("\n".join(user_texts))
-    instruction = "\n\n".join(prompt_lines).strip()
-    return [[{"role": "user", "content": []}]], images if images else []
+        conversation.insert(0, {"role": "system", "content": "\n\n".join(system_texts)})
+    return conversation
 
 
 def _parse_tool_calls(text: str) -> list[dict[str, Any]]:
@@ -110,6 +132,38 @@ def _parse_tool_calls(text: str) -> list[dict[str, Any]]:
 
 def _strip_tool_markup(text: str) -> str:
     return re.sub(r"<tool_call>.*?</tool_call>", "", text, flags=re.DOTALL).strip()
+
+
+def _build_agent_vlm_inputs(
+    processor,
+    conversation: list[dict[str, Any]],
+    *,
+    openai_tools: list[dict[str, Any]] | None,
+) -> dict[str, torch.Tensor]:
+    """Agent path: proper system role + no Psi0 lowercasing."""
+    if process_vision_info is None:
+        raise ImportError("qwen_vl_utils is required for Qwen3-VL agent chat.")
+    if openai_tools:
+        chat_text = processor.apply_chat_template(
+            conversation,
+            tools=openai_tools,
+            add_generation_prompt=True,
+            tokenize=False,
+        )
+    else:
+        chat_text = processor.apply_chat_template(
+            conversation,
+            add_generation_prompt=True,
+            tokenize=False,
+        )
+    image_inputs, video_inputs = process_vision_info([conversation], image_patch_size=16)
+    return processor(
+        text=[chat_text],
+        images=image_inputs,
+        videos=video_inputs,
+        padding=True,
+        return_tensors="pt",
+    )
 
 
 class ChatQwen3VLLocal(BaseChatModel):
@@ -152,37 +206,46 @@ class ChatQwen3VLLocal(BaseChatModel):
         messages: Sequence[BaseMessage],
     ) -> tuple[dict[str, torch.Tensor], str]:
         tower = self._load_tower()
-        _, images = _langchain_messages_to_qwen(messages)
-        system_texts = [str(m.content) for m in messages if isinstance(m, SystemMessage)]
-        human_texts: list[str] = []
-        for m in messages:
-            if isinstance(m, HumanMessage):
-                _, txt = _message_content_to_parts(m.content)
-                if txt:
-                    human_texts.append(txt)
-        instruction = "\n\n".join(system_texts + human_texts).strip()
-        if not images:
-            raise ValueError("ChatQwen3VLLocal requires at least one image in messages")
+        conversation = _langchain_messages_to_qwen_conversation(messages)
+        if not any(m.get("role") == "user" for m in conversation):
+            raise ValueError("ChatQwen3VLLocal requires at least one user message with image(s)")
+
+        has_image = False
+        for turn in conversation:
+            if turn.get("role") != "user":
+                continue
+            content = turn.get("content")
+            if isinstance(content, list) and any(
+                isinstance(b, dict) and b.get("type") == "image" for b in content
+            ):
+                has_image = True
+                break
+        if not has_image:
+            raise ValueError("ChatQwen3VLLocal requires at least one image in user messages")
 
         openai_tools = None
         if self.bound_tools:
             openai_tools = [convert_to_openai_tool(t) for t in self.bound_tools]
-
-        proc = tower.processor
-        from phi0.models.vlm.preprocess import _vlm_messages
-
-        vlm_messages = _vlm_messages(images, instruction)
-        if openai_tools:
-            chat_text = proc.apply_chat_template(
-                vlm_messages[0],
-                tools=openai_tools,
-                add_generation_prompt=True,
-                tokenize=False,
-            )
-            vlm = build_qwenvl_inputs_single(proc, images, instruction, chat_text=chat_text)
+            vlm = _build_agent_vlm_inputs(tower.processor, conversation, openai_tools=openai_tools)
         else:
-            vlm = build_qwenvl_inputs_single(proc, images, instruction)
-        return vlm, instruction
+            # ponytail: non-agent callers keep Psi0 normalize path
+            _, images = _message_content_to_parts(
+                next(m for m in reversed(messages) if isinstance(m, HumanMessage)).content
+            )
+            system_texts = [str(m.content) for m in messages if isinstance(m, SystemMessage)]
+            human_texts: list[str] = []
+            for m in messages:
+                if isinstance(m, HumanMessage):
+                    _, txt = _message_content_to_parts(m.content)
+                    if txt:
+                        human_texts.append(txt)
+            instruction = "\n\n".join(system_texts + human_texts).strip()
+            vlm = build_qwenvl_inputs_single(tower.processor, images, instruction)
+        summary = json.dumps(
+            [{"role": m.get("role"), "has_image": m.get("role") == "user"} for m in conversation],
+            ensure_ascii=False,
+        )
+        return vlm, summary
 
     def _generate(
         self,
@@ -200,7 +263,6 @@ class ChatQwen3VLLocal(BaseChatModel):
         }
         gen_cfg = self.gen_cfg
         if self.bound_tools:
-            # ponytail: official instruct emits <tool_call> blocks; keep MM token suppress off
             gen_cfg = GenerateTextConfig(
                 max_new_tokens=gen_cfg.max_new_tokens,
                 do_sample=gen_cfg.do_sample,
@@ -213,5 +275,9 @@ class ChatQwen3VLLocal(BaseChatModel):
         raw = texts[0] if texts else ""
         tool_calls = _parse_tool_calls(raw) if self.bound_tools else []
         content = _strip_tool_markup(raw) if tool_calls else raw.strip()
-        ai = AIMessage(content=content, tool_calls=tool_calls)
+        ai = AIMessage(
+            content=content,
+            tool_calls=tool_calls,
+            additional_kwargs={"raw": raw},
+        )
         return ChatResult(generations=[ChatGeneration(message=ai)])

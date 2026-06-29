@@ -76,6 +76,8 @@ def parse_args():
     p.add_argument("--start-delay-s", type=float, default=0.5)
     p.add_argument("--arm-flag", type=str, default="")
     p.add_argument("--ready-flag", type=str, default="")
+    p.add_argument("--arm-timeout-s", type=float, default=600.0)
+    p.add_argument("--ready-timeout-s", type=float, default=900.0)
     p.add_argument("--hand-ramp-frames", type=int, default=40)
     p.add_argument(
         "--precompute-out",
@@ -267,6 +269,8 @@ def _stream_over_zmq(
     ready_flag: str,
     start_delay_s: float,
     hand_ramp_frames: int,
+    arm_timeout_s: float = 600.0,
+    ready_timeout_s: float = 900.0,
 ) -> None:
     num_frames = int(tokens.shape[0])
     messages = prebuild_latent_action_messages(
@@ -287,12 +291,12 @@ def _stream_over_zmq(
     logger.info("bound tcp://%s:%d", zmq_host, zmq_port)
 
     if arm_flag:
-        _wait_flag(Path(arm_flag), label="arm")
+        _wait_flag(Path(arm_flag), label="arm", timeout_s=arm_timeout_s)
         time.sleep(start_delay_s)
         _send_deploy_start_commands(pub)
 
     if ready_flag:
-        _wait_flag(Path(ready_flag), label="ready")
+        _wait_flag(Path(ready_flag), label="ready", timeout_s=ready_timeout_s)
         time.sleep(start_delay_s)
         _send_deploy_start_commands(pub)
 
@@ -373,6 +377,8 @@ def main() -> None:
         ready_flag=args.ready_flag,
         start_delay_s=float(args.start_delay_s),
         hand_ramp_frames=int(args.hand_ramp_frames),
+        arm_timeout_s=float(args.arm_timeout_s),
+        ready_timeout_s=float(args.ready_timeout_s),
     )
 
 

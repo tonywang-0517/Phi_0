@@ -56,7 +56,7 @@ Cross-attn 模式（`action_cross_attn_mode`）：
 
 ## Eval 效果（LangChain Agent → Phi0 → SONIC sim）
 
-用户说：**「你可以把沙发上的纸巾拿起来么？」**；官方 **Qwen3-VL-2B-Instruct**（LangChain + tool calling）结合 ep447 **ego + 左腕**画面理解意图并中文回复；选中 `pick_tissues` 后走与 §3 **相同的 SONIC latent 开环管线**（Phi0 precompute → ZMQ v4 → TensorRT deploy + Dex3 三指夹爪 + MuJoCo 录屏）。
+用户说：**「你可以把沙发上的纸巾拿起来么？」**；官方 **Qwen3-VL-2B-Instruct**（LangChain + tool calling）结合 ep447 **ego + 左腕**画面理解意图并中文回复；选中 `pick_tissues` 后走与 §3 **相同的 SONIC latent 开环管线**（publisher **在线加载 VLM+Phi0 推理** dataset clip → ZMQ v4 → TensorRT deploy + Dex3 + MuJoCo 录屏）。
 
 <p align="center">
   <img src="assets/agent_pick_tissues_ep447_demo.gif" alt="LangChain agent pick tissues ep447 SONIC sim" width="90%">
@@ -82,13 +82,15 @@ Cross-attn 模式（`action_cross_attn_mode`）：
 
 | 文件 | 说明 |
 |------|------|
-| `logs/agent_sonic_sim_demo/agent_result.json` | Agent 回复 + `selected_skill` |
-| `logs/agent_sonic_sim_demo/agent_pick_tissues_ep447_sonic_latent_model.mp4` | SONIC sim 录屏 |
+| `Phi_0/logs/agent_sonic_sim_demo/agent_result.json` | Agent 回复、`tool_steps`、`selected_skill`、`model_raw` |
+| `Phi_0/logs/agent_sonic_sim_demo/agent_pick_tissues_ep447_sonic_latent_model.mp4` | SONIC sim 录屏（~12s H.264） |
 
-一键复现：
+成功标志：`agent_result.json` 里 `tool_steps` 非空且含 `pick_tissues`；mp4 在 `Phi_0/logs/...`（`out-dir` 会 resolve 为绝对路径，与 sim 读写的 flag 一致）。
+
+一键复现（**由 Agent 自行选技能并驱动 Phi0**，不要加 `--force-skill`）：
 
 ```bash
-pip install langchain langchain-core   # 或 pip install -e ".[agent]"
+pip install -e ".[agent]" -i https://pypi.tuna.tsinghua.edu.cn/simple   # langchain + langchain-core
 
 CUDA_VISIBLE_DEVICES=4 \
 GT_PANEL_LAYOUT=top ENABLE_G1_DEBUG_OVERLAY=0 \
@@ -99,6 +101,8 @@ bash scripts/run_phi0_agent_zmq_sim_demo.sh \
   --out-dir logs/agent_sonic_sim_demo
 ```
 
+首轮约 3min（Agent Qwen3-VL + SONIC publisher 各加载一次 VLM）。`tool_steps` 为空说明模型未输出 `<tool_call>`——见 `src/phi0/agent/prompts.py` 与自动重试逻辑。
+
 仅测 Agent（不启 SONIC sim / deploy）：
 
 ```bash
@@ -106,6 +110,18 @@ PYTHONPATH=src python scripts/phi0_langchain_agent_demo.py --dry-run
 ```
 
 跳过 Agent、直接测 SONIC 执行：`bash scripts/run_phi0_agent_zmq_sim_demo.sh --force-skill pick_tissues`。
+
+**复用 npz（可选，加速重复录屏）**：默认 publisher **inline 推理**（无离线 precompute）。仅反复录同一轨迹时可：
+
+```bash
+# 生成缓存（可选）
+FORCE_PRECOMPUTE=1 CHECKPOINT=... bash scripts/run_pick_tissue_sonic_latent_eval.sh ...
+
+# Agent demo 指定已有 npz
+PRECOMPUTE_IN=logs/.../sonic_latent_precompute.npz bash scripts/run_phi0_agent_zmq_sim_demo.sh ...
+```
+
+**SONIC eval 同步说明**：`run_pick_tissue_sonic_latent_eval.sh` 将 `WORK_DIR` 转为绝对路径（sim 在 `GR00T-WholeBodyControl/` 下跑，相对路径会导致 `.record_start` / `.replay_go` 错位、录屏失败）。Publisher 在 deploy 站稳且 `sim_record` 启动后才收到 `.replay_go`；默认 `--ready-timeout-s 900`（正常 ~30–60s，慢环境留余量）。可覆盖：`REPLAY_READY_TIMEOUT_S=300`。
 
 细节见 [Pick-tissue 工作流 §7](#7-langchain-agent-全链路推荐语言--sonic-执行)。
 
@@ -393,7 +409,9 @@ python scripts/phi0_sonic_latent_zmq_publisher.py \
 |--------|----------|
 | top panel + 无 marker（推荐） | `GT_PANEL_LAYOUT=top ENABLE_G1_DEBUG_OVERLAY=0` |
 | inset + debug marker | 脚本默认 |
-| 复用已有 precompute | 把 npz 放到 `$WORK_DIR/sonic_latent_precompute.npz` 或 `SKIP_PRECOMPUTE=1` |
+| 默认推理 | publisher 启动时 inline 加载 VLM+Phi0 |
+| 复用 npz | `FORCE_PRECOMPUTE=1` 或 `--precompute-in` / `PRECOMPUTE_IN=...` |
+| 录屏 flag | `WORK_DIR` 自动 `cd` 为绝对路径（勿用手写相对路径跨 `Phi_0` / `GR00T`） |
 
 **从 npz 重放 ZMQ（不加载 VLM，调试用）：**
 
@@ -476,7 +494,9 @@ CUDA_VISIBLE_DEVICES=4 python scripts/vlm_agent_speech_demo.py \
 
 见上文 [Eval 效果（LangChain Agent）](#eval-效果langchain-agent--phi0--sonic-sim)。
 
-**依赖**：`Phi-0-wpy`、`GR00T-WholeBodyControl/.venv_sim`、`gear_sonic_deploy`（TensorRT）、`pip install langchain langchain-core`。
+**依赖**：`Phi-0-wpy`、`GR00T-WholeBodyControl/.venv_sim`、`gear_sonic_deploy`（TensorRT）、`pip install -e ".[agent]"`。
+
+**Agent tool calling**：官方 Qwen3-VL 须输出 `<tool_call>{"name":"pick_tissues",...}</tool_call>`；`ChatQwen3VLLocal` 用 `system`/`user` 分角色拼 chat template（勿与 Psi0 训练路径混用 `lower()` instruction）；无 tool 时最多重试 2 次（`robot_agent.py`）。
 
 **三技能**（LangChain `@tool` → `Phi0SkillRouter`）：
 
@@ -489,7 +509,7 @@ CUDA_VISIBLE_DEVICES=4 python scripts/vlm_agent_speech_demo.py \
 修改路径：`src/phi0/agent/checkpoints.py` 或 CLI `--pick-checkpoint` / `--throw-checkpoint`。
 
 ```bash
-# 全流程：Agent 决策 → SONIC sim mp4（内部调用 run_pick_tissue_sonic_latent_eval.sh）
+# 全流程：Agent 自行决策 → 若选中 pick/throw 则 SONIC sim mp4
 CUDA_VISIBLE_DEVICES=4 \
 GT_PANEL_LAYOUT=top ENABLE_G1_DEBUG_OVERLAY=0 \
 bash scripts/run_phi0_agent_zmq_sim_demo.sh \
@@ -503,7 +523,7 @@ PYTHONPATH=src python scripts/phi0_langchain_agent_demo.py \
   --user-instruction '你可以把沙发上的纸巾拿起来么？' \
   --episode-idx 447 --dry-run
 
-# 跳过 Agent，只测 SONIC 执行
+# 调试专用：跳过 Agent，只测 SONIC 执行（不测 Agent 操控能力）
 bash scripts/run_phi0_agent_zmq_sim_demo.sh --force-skill pick_tissues --episode-idx 447
 ```
 

@@ -9,7 +9,11 @@ from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
 from PIL import Image
 
 from phi0.agent.executor import Phi0SkillRouter
-from phi0.agent.prompts import ROBOT_SYSTEM_PROMPT_ZH, build_agent_user_turn
+from phi0.agent.prompts import (
+    ROBOT_SYSTEM_PROMPT_ZH,
+    TOOL_CALL_RETRY_USER,
+    build_agent_user_turn,
+)
 from phi0.agent.qwen_vl_chat import ChatQwen3VLLocal
 from phi0.agent.tools import ROBOT_TOOLS, bind_runtime
 from phi0.models.vlm.tower import GenerateTextConfig
@@ -43,10 +47,14 @@ def _output_without_follow_up(ai_msg: AIMessage, tool_steps: list[dict[str, Any]
     return f"好的，正在执行：{', '.join(names)}。"
 
 
+MAX_TOOL_CALL_RETRIES = 2
+
+
 @dataclass
 class RobotAgent:
     llm: ChatQwen3VLLocal
     phi0_router: Phi0SkillRouter | None = None
+    max_tool_retries: int = MAX_TOOL_CALL_RETRIES
 
     def _human_message(
         self,
@@ -70,7 +78,10 @@ class RobotAgent:
         dry_run: bool = False,
         follow_up_reply: bool = False,
     ) -> dict[str, Any]:
-        user_text = build_agent_user_turn(user_instruction)
+        user_text = build_agent_user_turn(
+            user_instruction,
+            has_wrist_image=wrist_image is not None,
+        )
         bind_runtime(
             self.phi0_router,
             ego_image=ego_image,
@@ -87,7 +98,21 @@ class RobotAgent:
                     messages.append(AIMessage(content=text))
         messages.append(self._human_message(user_text, ego_image, wrist_image))
 
-        ai_msg: AIMessage = self.llm.bind_tools(ROBOT_TOOLS).invoke(messages)
+        llm_with_tools = self.llm.bind_tools(ROBOT_TOOLS)
+        raw_attempts: list[str] = []
+        ai_msg: AIMessage = AIMessage(content="")
+        for attempt in range(self.max_tool_retries + 1):
+            ai_msg = llm_with_tools.invoke(messages)
+            raw = str(ai_msg.additional_kwargs.get("raw", ai_msg.content or ""))
+            raw_attempts.append(raw)
+            if ai_msg.tool_calls or attempt >= self.max_tool_retries:
+                break
+            messages = [
+                *messages,
+                AIMessage(content=str(ai_msg.content or "")),
+                HumanMessage(content=TOOL_CALL_RETRY_USER),
+            ]
+
         tool_steps: list[dict[str, Any]] = []
         if ai_msg.tool_calls:
             tool_map = {t.name: t for t in ROBOT_TOOLS}
@@ -114,6 +139,9 @@ class RobotAgent:
             "user_instruction": user_instruction,
             "output": output,
             "tool_steps": tool_steps,
-            "first_pass": ai_msg.content,
+            "first_pass": raw_attempts[0] if raw_attempts else ai_msg.content,
+            "model_raw": raw_attempts[-1] if raw_attempts else "",
+            "raw_attempts": raw_attempts,
+            "tool_retry_count": max(0, len(raw_attempts) - 1),
             "selected_skill": selected_skill,
         }
