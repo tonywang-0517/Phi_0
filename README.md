@@ -42,6 +42,18 @@ Cross-attn 模式（`action_cross_attn_mode`）：
 
 ---
 
+## Eval 效果（pick-tissue SONIC）
+
+`pick_tissue_xperience_unified_3k_ddp4_fast` 在默认 eval clip **ep447** 上的开环 SONIC deploy（上：ego + 左腕 GT 视频；下：MuJoCo sim + TensorRT deploy + Dex3 三指夹爪）：
+
+<p align="center">
+  <img src="assets/pick_tissue_ep447_sonic_latent_eval.gif" alt="Pick-tissue ep447 SONIC latent eval" width="90%">
+</p>
+
+生成命令见下文 [Pick-tissue 工作流 §3](#3-sonic-开环-eval--录-mp4推荐含三指夹爪)；录屏来源：`logs/pick_tissue_finetune/sonic_latent_model_<ts>/pick_tissue_ep447_sonic_latent_model.mp4`。
+
+---
+
 ## 设计优势
 
 ### 性能
@@ -306,6 +318,17 @@ python scripts/phi0_sonic_latent_zmq_publisher.py \
 | inset + debug marker | 脚本默认 |
 | 复用已有 precompute | 把 npz 放到 `$WORK_DIR/sonic_latent_precompute.npz` 或 `SKIP_PRECOMPUTE=1` |
 
+**从 npz 重放 ZMQ（不加载 VLM，调试用）：**
+
+```bash
+python scripts/phi0_sonic_latent_zmq_publisher.py \
+  --precompute-in logs/pick_tissue_finetune/sonic_latent_model_<ts>/sonic_latent_precompute.npz \
+  --config-name train_pick_tissue_xperience_unified_ddp4_3k \
+  --episode-idx 447 \
+  --zmq-port 5556 \
+  --control-fps 50
+```
+
 ### 4. Humanoid-GPT ZMQ eval（tracker sim，**无** Dex3 手模）
 
 见 [`experiments/phi0_hgpt_zmq/README.md`](experiments/phi0_hgpt_zmq/README.md)。
@@ -314,6 +337,61 @@ python scripts/phi0_sonic_latent_zmq_publisher.py \
 CHECKPOINT=/path/to.ckpt EPISODE_IDX=447 USE_GT=0 DEPLOY_MODE=smpl \
 CUDA_VISIBLE_DEVICES=4 bash scripts/run_pick_tissue_hgpt_zmq_eval.sh
 ```
+
+### 5. 真机 SONIC 开环 deploy（ZMQ v4）
+
+与 §3 相同数据路径（`phi0_sonic_latent_zmq_publisher.py` → ZMQ **5556** → `g1_deploy_onnx_ref --input-type zmq_manager`），**去掉 MuJoCo sim 与 mp4 录屏**，在 G1 真机上执行 precompute 轨迹。
+
+> **开环**：precompute 使用数据集 ep447 的 ego/wrist 视频 + GT proprio LUT，**非**机载相机闭环。真机闭环需另接 camera server（5555）与在线推理，见 `GR00T-WholeBodyControl/G1_VISION_TO_GR00T.md`。
+
+**前提**：`gear_sonic_deploy` 已编译；控制机与 G1 同网（`192.168.123.x`）；真机 deploy **不要**加 `--disable-crc-check`。
+
+**Step 0 — 离线 precompute（可与 sim eval 复用同一 npz）：**
+
+```bash
+python scripts/phi0_sonic_latent_zmq_publisher.py \
+  --checkpoint experiments/pick_tissue_xperience_unified_3k_ddp4_fast/pick_tissue_xperience_unified_act_latest.pt \
+  --config-name train_pick_tissue_xperience_unified_ddp4_3k \
+  --episode-idx 447 \
+  --control-fps 50 \
+  --motion-seconds 16.62 \
+  --precompute-out /tmp/ep447_precompute.npz \
+  --device cuda
+```
+
+**Step 1 — Terminal A：真机 C++ deploy**（`GR00T-WholeBodyControl/gear_sonic_deploy`）：
+
+```bash
+source scripts/setup_env.sh
+./deploy.sh --input-type zmq_manager real --zmq-host 127.0.0.1 --zmq-port 5556
+# Init Done 后：] 启动控制 → ENTER（ZMQ STREAMING MODE: ENABLED）→ I 站稳；O 急停
+```
+
+publisher 在另一台机器时，将 `--zmq-host` 改为 publisher 所在 IP。
+
+**Step 2 — Terminal B：ZMQ 推流**（deploy 已进入 streaming 且站稳后）：
+
+```bash
+cd Phi_0
+python scripts/phi0_sonic_latent_zmq_publisher.py \
+  --precompute-in /tmp/ep447_precompute.npz \
+  --config-name train_pick_tissue_xperience_unified_ddp4_3k \
+  --episode-idx 447 \
+  --zmq-port 5556 \
+  --control-fps 50 \
+  --motion-seconds 16.62
+```
+
+可选：用 `--arm-flag` / `--ready-flag` 与 sim eval 脚本同样的时序协调（见 `run_pick_tissue_sonic_latent_eval.sh`）。
+
+### 6. VLM Agent 说话 demo（eval 可选，与 action 解耦）
+
+```bash
+CUDA_VISIBLE_DEVICES=4 python scripts/vlm_agent_speech_demo.py \
+  --enable-agent-speech --episode-idx 447 --skip-action
+```
+
+输出：`logs/pick_tissue_finetune/agent_speech_ep447_<ts>.txt`
 
 ---
 
