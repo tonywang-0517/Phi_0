@@ -65,6 +65,13 @@ PromptEmbedCache = VLMContextCache
 
 
 @dataclass
+class AgentTurnResult:
+    """Eval-only: frozen agent utterance from the first input (not per action chunk)."""
+
+    text: str
+
+
+@dataclass
 class ClipInputsCache:
     """Lazy cache for ``build_inputs`` + VLM context per clip index."""
 
@@ -144,6 +151,7 @@ class ActionInferenceSession:
         use_gt_history: bool | None = None,
         max_rgb_frames: int = 33,
         use_wrist_view: bool = False,
+        agent_speech_model_path: str | None = None,
     ) -> None:
         del max_rgb_frames, action_video_freq_ratio
         self.model = model
@@ -161,6 +169,17 @@ class ActionInferenceSession:
         self.vggt_context_emb: Optional[torch.Tensor] = None
         self._vlm_inputs: Optional[Dict[str, torch.Tensor]] = None
         self._video_clip: Optional[torch.Tensor] = None
+        # Eval-only VLM agent speech (default off; never used in training).
+        self._agent_speech_enabled: bool = False
+        self._agent_speech_done: bool = False
+        self._agent_text: str = ""
+        self._agent_vlm_inputs: Optional[Dict[str, torch.Tensor]] = None
+        self._agent_speech_model_path: str | None = (
+            str(agent_speech_model_path).strip() if agent_speech_model_path else None
+        )
+        self._agent_speech_tower: Any | None = None
+        self._agent_instruction: str = ""
+        self._wrist_video_clip: Optional[torch.Tensor] = None
         w = int(getattr(model, "past_action_window_size", 1) or 1)
         if getattr(model, "uses_history_action_input", lambda: False)():
             history_window = int(getattr(model, "action_history_window", 0) or 0)
@@ -183,6 +202,11 @@ class ActionInferenceSession:
         self.vggt_context_emb = None
         self._vlm_inputs = None
         self._video_clip = None
+        self._agent_speech_done = False
+        self._agent_text = ""
+        self._agent_vlm_inputs = None
+        self._agent_instruction = ""
+        self._wrist_video_clip = None
         self._proprio_history.clear()
         self._proprio_hold = None
         self.video_refresh_count = 0
@@ -221,12 +245,69 @@ class ActionInferenceSession:
     def set_history_gt(self, history: torch.Tensor) -> None:
         self.set_proprio_gt(history)
 
+    def enable_agent_speech_for_eval(
+        self,
+        enabled: bool = True,
+        *,
+        model_path: str | None = None,
+    ) -> None:
+        """Opt-in eval-only agent AR. Call before the first ``prefill``; default off."""
+        self._agent_speech_enabled = bool(enabled)
+        if model_path is not None:
+            path = str(model_path).strip()
+            self._agent_speech_model_path = path or None
+            self._agent_speech_tower = None
+        if not enabled:
+            self._agent_speech_done = False
+            self._agent_text = ""
+            self._agent_vlm_inputs = None
+            self._agent_instruction = ""
+            self._wrist_video_clip = None
+
+    @property
+    def agent_speech_enabled(self) -> bool:
+        return self._agent_speech_enabled
+
+    @property
+    def agent_text(self) -> str:
+        return self._agent_text
+
+    def _snapshot_agent_vlm_inputs(self, vlm_inputs: Dict[str, torch.Tensor]) -> None:
+        """Freeze first-eval VLM batch; later ``refresh_*`` must not re-run agent AR."""
+        if not self._agent_speech_enabled or self._agent_vlm_inputs is not None:
+            return
+        self._agent_vlm_inputs = {
+            k: v.detach().clone() if torch.is_tensor(v) else v
+            for k, v in vlm_inputs.items()
+        }
+
+    def _resolve_agent_speech_tower(self):
+        action_tower = self.model.vlm_tower
+        path = self._agent_speech_model_path
+        if not path:
+            return action_tower
+        if self._agent_speech_tower is None:
+            from phi0.models.vlm.tower import load_agent_speech_tower
+
+            attn = "sdpa"
+            if action_tower is not None and hasattr(action_tower, "attn_implementation"):
+                attn = str(action_tower.attn_implementation)
+            self._agent_speech_tower = load_agent_speech_tower(
+                path,
+                device=str(self.model.device),
+                torch_dtype=self.model.torch_dtype,
+                attn_implementation=attn,
+                local_files_only=False,
+            )
+        return self._agent_speech_tower
+
     def _build_vlm_inputs_from_video(
         self,
         video: torch.Tensor,
         instruction: str,
         *,
         wrist_video: torch.Tensor | None = None,
+        vlm_tower=None,
     ) -> Dict[str, torch.Tensor]:
         from phi0.models.vlm.preprocess import (
             build_deploy_vlm_inputs_from_pixels,
@@ -243,10 +324,11 @@ class ActionInferenceSession:
                     f"wrist_video must be [B,3,T,H,W], got {tuple(wrist_video.shape)}"
                 )
             wrist_pixel = video_bcthw_to_pixel_batch(wrist_video)
-        processor_obj = getattr(self.model.vlm_tower, "processor", None)
+        tower = vlm_tower if vlm_tower is not None else self.model.vlm_tower
+        processor_obj = getattr(tower, "processor", None)
         if processor_obj is None:
             batch = int(video.shape[0])
-            seq = int(getattr(self.model.vlm_tower, "num_context_tokens", 16))
+            seq = int(getattr(tower, "num_context_tokens", 16))
             device = video.device
             pixel_stat = float(pixel.mean())
             return {
@@ -263,6 +345,24 @@ class ActionInferenceSession:
             model_max_length=int(getattr(self.model, "prompt_max_length", 512)),
             wrist_pixel=wrist_pixel,
         )
+
+    def _agent_speech_vlm_inputs(self) -> Dict[str, torch.Tensor] | None:
+        speech_tower = self._resolve_agent_speech_tower()
+        action_tower = self.model.vlm_tower
+        if speech_tower is action_tower:
+            return self._agent_vlm_inputs or self._vlm_inputs
+        if self._video_clip is None:
+            return self._agent_vlm_inputs or self._vlm_inputs
+        vlm_inputs = self._build_vlm_inputs_from_video(
+            self._video_clip,
+            self._agent_instruction,
+            wrist_video=self._wrist_video_clip,
+            vlm_tower=speech_tower,
+        )
+        return {
+            k: v.to(device=self.model.device) if torch.is_tensor(v) else v
+            for k, v in vlm_inputs.items()
+        }
 
     def _set_action_context(
         self,
@@ -310,6 +410,12 @@ class ActionInferenceSession:
         if wrist_video is not None:
             wrist_video = wrist_video.to(device=self.model.device, dtype=self.model.torch_dtype)
         self._video_clip = video.detach()
+        if wrist_video is not None:
+            self._wrist_video_clip = wrist_video.detach()
+        else:
+            self._wrist_video_clip = None
+        if self._agent_speech_enabled:
+            self._agent_instruction = str(instruction)
         batch_size = int(video.shape[0])
 
         if not self.model.uses_vlm_tower():
@@ -328,6 +434,7 @@ class ActionInferenceSession:
             for key, value in vlm_inputs.items():
                 vlm_inputs[key] = value.to(device=self.model.device)
             self._vlm_inputs = vlm_inputs
+            self._snapshot_agent_vlm_inputs(vlm_inputs)
             action_ctx, action_ctx_mask = self.model.vlm_tower.extract_action_context(
                 vlm_inputs["input_ids"],
                 vlm_inputs["attention_mask"],
@@ -514,6 +621,34 @@ class ActionInferenceSession:
                 return self.processor.postprocess(out.unsqueeze(0)).squeeze(0)
             return self.processor.postprocess(out)
         return out
+
+    @torch.no_grad()
+    def run_agent_speech_once(
+        self,
+        *,
+        gen_cfg: Any | None = None,
+        batch_index: int = 0,
+        **generate_kwargs: Any,
+    ) -> str:
+        """Eval-only: one HF ``generate`` on the first input, then no-op until ``reset()``."""
+        if not self._agent_speech_enabled:
+            return ""
+        if self._agent_speech_done:
+            return self._agent_text
+        vlm_inputs = self._agent_speech_vlm_inputs()
+        if vlm_inputs is None or not self.model.uses_vlm_tower():
+            return ""
+        tower = self._resolve_agent_speech_tower()
+        gen_fn = getattr(tower, "generate_text_from_vlm_batch", None)
+        if gen_fn is None:
+            return ""
+        texts = gen_fn(vlm_inputs, gen_cfg=gen_cfg, **generate_kwargs)
+        idx = int(batch_index)
+        if idx < 0 or idx >= len(texts):
+            raise IndexError(f"batch_index {idx} out of range for {len(texts)} replies")
+        self._agent_text = str(texts[idx])
+        self._agent_speech_done = True
+        return self._agent_text
 
     @torch.no_grad()
     def predict_segments(

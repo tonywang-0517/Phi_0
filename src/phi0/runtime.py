@@ -1017,6 +1017,8 @@ def prepare_model_batch_cpu(
             "vlm_inputs": vlm_inputs,
         }
     )
+    if obs_wrist_pixel is not None:
+        payload["obs_wrist_pixel"] = obs_wrist_pixel
     return payload
 
 

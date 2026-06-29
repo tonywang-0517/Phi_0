@@ -49,3 +49,11 @@ __pycache__/
 # Vendored sim / benchmark deps (install via scripts/setup_benchmark_data.sh)
 third_party/
 *.zip
+
+# Local env / run artifacts (never commit)
+.cache/
+.runs/
+.venv-openpi/
+logs/
+wandb/
+.env.sample.local

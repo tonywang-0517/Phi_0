@@ -8,6 +8,8 @@ vlm:
   # Psi0 finetune-simple-psi0.sh: resize/center_crop 180×320 (H×W)
   image_size: [180, 320]
   img_aug: false
+  # Eval-only agent AR weights; null = reuse model_path (Psi0). Action train/infer always uses model_path.
+  agent_speech_model_path: null
 
 prompt_max_length: 512
 # Single current-frame proprio prefix (no action history).

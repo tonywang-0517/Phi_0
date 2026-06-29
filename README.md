@@ -170,7 +170,23 @@ RGB frame(s) + task instruction
 Proprio 前缀 + future horizon ──► ActionACTDiT / ActionFMDiT ──► action chunk
 ```
 
-VLM **不做** `.generate()` 文本解码；语言指令仅作 multimodal 条件。
+VLM 默认仅 **encoder forward** → Action DiT；**训练与常规 action 推理不会**调用 `generate`。
+
+**Eval 可选 Agent 说话**（显式 `--enable-agent-speech` / `enable_agent_speech_for_eval(True)`，整段 eval **只做一次** AR，首帧输入快照；`refresh_*` 与多 chunk `predict` 不重复生成）：
+
+```python
+session.enable_agent_speech_for_eval(True)  # 首次 prefill 之前
+session.prefill_from_video_clip(video, instruction)
+agent_text = session.run_agent_speech_once()
+action = session.predict(num_frames)
+```
+
+Demo（默认 ep447，`--skip-action` 仅测 VLM 说话）：
+
+```bash
+CUDA_VISIBLE_DEVICES=4 python scripts/vlm_agent_speech_demo.py \
+  --enable-agent-speech --episode-idx 447 --skip-action
+```
 
 ### 损失
 
@@ -249,6 +265,8 @@ bash scripts/run_train_pick_tissue_xperience_unified_ddp4_23k.sh  # 续训 23k
 Checkpoint 示例：`experiments/pick_tissue_xperience_unified_3k_ddp4_fast/pick_tissue_xperience_unified_act_latest.pt`
 
 ### 3. SONIC 开环 eval + 录 mp4（**推荐**，含三指夹爪）
+
+**默认 eval clip**：unified `episode_index=447`（manifest ep2，~831 帧 @50 Hz，task=`pick tissue`）。SONIC / HGPT / Agent demo 均以此为准，便于横向对比。
 
 两阶段：离线 precompute（VLM 推理 → npz）→ sim + TensorRT deploy + ZMQ v4 流式回放。
 
@@ -368,5 +386,5 @@ Phi_0/
 | Phi-0 → HGPT ZMQ eval | ✅ |
 | Lazy GT proprio LUT | ✅ |
 | VGGT dual cross-attn（三塔） | ✅ |
-| VLM 自回归语言 Agent | ❌（仅 encoder；规划可外挂） |
+| VLM Agent 说话（eval 显式开启，首输入单次 `generate`） | ✅ |
 | RL / MoE Action Head | 🔜 预留 |

@@ -185,6 +185,20 @@ Checkpoint：`experiments/<name>/pick_tissue_xperience_unified_act_latest.pt`（
 
 ## 6. 部署路径
 
+### 6.0 默认 eval clip：`episode_index=447`
+
+Pick-tissue 回归 / 开环 eval / Agent 说话 demo **默认使用同一条 clip**：
+
+| 字段 | 值 |
+|------|-----|
+| unified `episode_index` | **447**（manifest session **ep2**） |
+| dataset clip row | **318688**（shuffle 后；`clip_dataset_index_for_episode()` 映射） |
+| 帧数 | ~831 @ 50 Hz |
+| task | `pick tissue` |
+| 参考录屏 | `logs/pick_tissue_finetune/sonic_latent_model_20260628_122146/pick_tissue_ep447_sonic_latent_model.mp4` |
+
+脚本默认值：`UNIFIED_EP=447`（`run_pick_tissue_sonic_latent_eval.sh`）、`--episode-idx 447`（`vlm_agent_speech_demo.py`）。
+
 ### 6.1 SONIC latent（推荐 pick-tissue 全链路 eval）
 
 模型输出 unified → 取 `[396:460]` token + `[346:360]` 夹爪 → ZMQ v4 → `g1_deploy_onnx_ref` → MuJoCo。
@@ -244,6 +258,40 @@ python scripts/phi0_sonic_latent_zmq_publisher.py \
   --episode-idx 447 \
   --zmq-port 5556
 ```
+
+### 6.3 VLM Agent 说话（eval 可选，与 action 解耦）
+
+- **默认关闭**：训练、`predict()`、开环 publisher **均不**调用 `generate`
+- **显式开启**：`enable_agent_speech_for_eval(True)`（首次 `prefill` 之前）
+- **只做一次**：`run_agent_speech_once()` 在**首帧** VLM 输入快照上 AR；`refresh_*` / 多 chunk `predict` **不会**再次生成
+
+```python
+session.enable_agent_speech_for_eval(True)
+session.prefill_from_video_clip(video_bcthw, instruction)
+agent_text = session.run_agent_speech_once(gen_cfg=GenerateTextConfig(max_new_tokens=128))
+action = session.predict(num_frames=8)
+```
+
+实现：`src/phi0/models/vlm/tower.py`。Demo（**默认 ep447 真实 ego/wrist 帧**）：
+
+```bash
+CUDA_VISIBLE_DEVICES=4 python scripts/vlm_agent_speech_demo.py \
+  --enable-agent-speech --episode-idx 447 --skip-action
+```
+
+输出：`logs/pick_tissue_finetune/agent_speech_ep447_<ts>.txt`
+
+**说明**：当前 Psi0 HE 微调 VLM 在 `generate` 时会倾向输出 vision token；`GenerateTextConfig(suppress_mm_tokens=True)`（默认）会屏蔽 MM 词表，使 AR 走纯文本。语言质量取决于 VLM 微调程度，与 action 路径独立。
+
+**Action 与 Agent 权重分离**（可选）：`model.vlm.model_path` 始终用于 action train/infer（Psi0）；eval agent 可单独设：
+
+```yaml
+vlm:
+  model_path: ./checkpoints/psi0/...   # action（默认）
+  agent_speech_model_path: Qwen/Qwen3-VL-2B-Instruct  # eval AR only；null = 复用 model_path
+```
+
+或 demo / session：`--agent-speech-model-path Qwen/Qwen3-VL-2B-Instruct`。对照测试：`pytest tests/unit/test_vlm_official_weights_restore_speech.py -s`
 
 ### 6.2 Humanoid-GPT ZMQ（tracker sim，无 Dex3 手模）
 
