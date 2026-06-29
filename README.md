@@ -54,6 +54,63 @@ Cross-attn 模式（`action_cross_attn_mode`）：
 
 ---
 
+## Eval 效果（LangChain Agent → Phi0 → SONIC sim）
+
+用户说：**「你可以把沙发上的纸巾拿起来么？」**；官方 **Qwen3-VL-2B-Instruct**（LangChain + tool calling）结合 ep447 **ego + 左腕**画面理解意图并中文回复；选中 `pick_tissues` 后走与 §3 **相同的 SONIC latent 开环管线**（Phi0 precompute → ZMQ v4 → TensorRT deploy + Dex3 三指夹爪 + MuJoCo 录屏）。
+
+<p align="center">
+  <img src="assets/agent_pick_tissues_ep447_demo.gif" alt="LangChain agent pick tissues ep447 SONIC sim" width="90%">
+</p>
+
+```
+用户指令 + ego/左腕图
+    → LangChain Agent（官方 Qwen3-VL，与 Psi0 VLM 分离）
+    → tool: pick_tissues | throw_rubbish | stay
+    → Phi0SkillRouter（按 skill 懒加载 checkpoint）
+    → run_pick_tissue_sonic_latent_eval.sh（仅 action skill）
+    → agent_*_sonic_latent_model.mp4
+```
+
+| 环节 | 组件 | 说明 |
+|------|------|------|
+| 语言 | `Qwen/Qwen3-VL-2B-Instruct` | Psi0 内嵌 VLM **无语言能力**，Agent 必须用官方权重 |
+| 技能 | `pick_tissues` / `throw_rubbish` / `stay` | 映射 Phi0 prompt：`pick tissue` / `throw rubbish`；`stay` 不调 Phi0 |
+| 权重路由 | `src/phi0/agent/checkpoints.py` | 每 skill 独立 ckpt；`throw_rubbish` 占位路径，训好只改路径 |
+| 执行 | `run_pick_tissue_sonic_latent_eval.sh` | 与 §3 相同；**不是** HGPT tracker 线 |
+
+**已测产物**（ep447，`MOTION_SECONDS=8`）：
+
+| 文件 | 说明 |
+|------|------|
+| `logs/agent_sonic_sim_demo/agent_result.json` | Agent 回复 + `selected_skill` |
+| `logs/agent_sonic_sim_demo/agent_pick_tissues_ep447_sonic_latent_model.mp4` | SONIC sim 录屏 |
+
+一键复现：
+
+```bash
+pip install langchain langchain-core   # 或 pip install -e ".[agent]"
+
+CUDA_VISIBLE_DEVICES=4 \
+GT_PANEL_LAYOUT=top ENABLE_G1_DEBUG_OVERLAY=0 \
+bash scripts/run_phi0_agent_zmq_sim_demo.sh \
+  --user-instruction '你可以把沙发上的纸巾拿起来么？' \
+  --episode-idx 447 \
+  --motion-seconds 8 \
+  --out-dir logs/agent_sonic_sim_demo
+```
+
+仅测 Agent（不启 SONIC sim / deploy）：
+
+```bash
+PYTHONPATH=src python scripts/phi0_langchain_agent_demo.py --dry-run
+```
+
+跳过 Agent、直接测 SONIC 执行：`bash scripts/run_phi0_agent_zmq_sim_demo.sh --force-skill pick_tissues`。
+
+细节见 [Pick-tissue 工作流 §7](#7-langchain-agent-全链路推荐语言--sonic-执行)。
+
+---
+
 ## 设计优势
 
 ### 性能
@@ -76,8 +133,8 @@ Cross-attn 模式（`action_cross_attn_mode`）：
 
 ### 工程与商业化
 
-- **控制器兼容**：SONIC deploy（ZMQ v4 latent）、Humanoid-GPT tracker、GMT 等。
-- **长期记忆解耦**：VLM 当前仅作 encoder，不做自回归语言 Agent（规划层可外挂）。
+- **控制器兼容**：SONIC deploy（ZMQ v4 latent，**推荐**）、Humanoid-GPT tracker（备选）、GMT 等。
+- **语言 Agent 外挂**：Phi0 VLM 仅 encoder；对话与 tool 调度由 `src/phi0/agent/`（官方 Qwen3-VL + LangChain）承担，再路由到 Phi0 action head。
 - **快速场景迁移**：Action Head 权重独立 fine-tune（如 pick-tissue 3k/8k/23k）。
 
 ---
@@ -114,6 +171,7 @@ GitHub 仓库仅含**源码**；权重与实验输出不入库。
 conda create -n Phi-0-wpy python=3.10 -y && conda activate Phi-0-wpy
 pip install -e /path/to/FastWAM
 pip install -e /path/to/Phi_0[train,viz]
+pip install -e /path/to/Phi_0[agent]   # LangChain Agent demo（langchain + langchain-core）
 pip install qwen-vl-utils   # Qwen3-VL 预处理
 pip install -e /path/to/vggt-omega   # 三塔 dual 模式（可选）
 ```
@@ -158,11 +216,12 @@ Checkpoint：`experiments/<name>/<name>_latest.pt`（可 `save_action_expert_onl
 python scripts/eval_action.py --checkpoint ... --config-name train_xperience_unified
 bash scripts/run_eval_visualize_xperience_unified.sh
 bash scripts/run_pick_tissue_sonic_latent_eval.sh   # SONIC deploy + mp4
+bash scripts/run_phi0_agent_zmq_sim_demo.sh         # LangChain Agent + SONIC（见 §7）
 ```
 
 ### Deploy
 
-Legacy 256-d JSONL deploy 仍可用；pick-tissue 走 SONIC / HGPT ZMQ，见下文与 [`docs/unified_action_design.md`](docs/unified_action_design.md)。
+Legacy 256-d JSONL deploy 仍可用；pick-tissue **推荐 SONIC**（§3 / §7）；HGPT tracker 见 §4。
 
 ---
 
@@ -252,8 +311,26 @@ Pick-tissue 使用 **50 Hz**，见 unified 文档。
 
 ### 1. 建数据
 
+Manifest：`Isaac-GR00T/data/pick_tissues.json`（pick tissue）、`throw_rubbish.json`（throw rubbish）。一键重建 GR00T valid + Phi0 unified + sonic unified：
+
 ```bash
-# valid 合并 + 512-d unified 转换（常用）
+bash /mnt/data2/wpy/workspace/Isaac-GR00T/scripts/rebuild_g1_manip_training_data.sh
+```
+
+输出：
+
+| 路径 | 用途 |
+|------|------|
+| `pick_tissue_valid` | 仅 pick tissue（eval ep447 等沿用） |
+| `g1_manip_valid` | pick tissue + throw rubbish 多任务 GR00T |
+| `pick_tissue_xperience_unified` | Phi0 512-d（pick only） |
+| `g1_manip_xperience_unified` | Phi0 512-d 多任务训练 |
+| `pick_tissue_sonic_unified` / `g1_manip_sonic_unified` | pi0.5 sonic 格式 |
+
+各数据集 `meta/tasks.jsonl` 写入对应 prompt（`pick tissue` / `throw rubbish`），parquet `task_index` 与之一致。
+
+```bash
+# 仅 pick-tissue valid 合并（旧路径，单任务）
 /mnt/data/miniconda3/envs/Phi-0-wpy/bin/python scripts/data/isaac_groot_to_xperience_unified_lerobot.py \
   --data-root /mnt/data2/wpy/workspace/Isaac-GR00T/data/pick_tissue_valid \
   --out-dir /mnt/data2/wpy/workspace/Isaac-GR00T/data/pick_tissue_xperience_unified \
@@ -386,12 +463,53 @@ python scripts/phi0_sonic_latent_zmq_publisher.py \
 
 ### 6. VLM Agent 说话 demo（eval 可选，与 action 解耦）
 
+Psi0 加载的 Qwen3-VL **语言能力差**；仅作对比/调试：
+
 ```bash
 CUDA_VISIBLE_DEVICES=4 python scripts/vlm_agent_speech_demo.py \
   --enable-agent-speech --episode-idx 447 --skip-action
 ```
 
 输出：`logs/pick_tissue_finetune/agent_speech_ep447_<ts>.txt`
+
+### 7. LangChain Agent 全链路（语言 + SONIC 执行）
+
+见上文 [Eval 效果（LangChain Agent）](#eval-效果langchain-agent--phi0--sonic-sim)。
+
+**依赖**：`Phi-0-wpy`、`GR00T-WholeBodyControl/.venv_sim`、`gear_sonic_deploy`（TensorRT）、`pip install langchain langchain-core`。
+
+**三技能**（LangChain `@tool` → `Phi0SkillRouter`）：
+
+| Tool | Phi0 instruction | Checkpoint（默认） |
+|------|------------------|-------------------|
+| `pick_tissues` | `pick tissue` | `experiments/pick_tissue_xperience_unified_3k_ddp4_fast/..._latest.pt` |
+| `throw_rubbish` | `throw rubbish` | `experiments/throw_rubbish_xperience_unified/..._latest.pt`（暂无则 fallback pick ckpt） |
+| `stay` | — | 不加载 Phi0、不推 ZMQ |
+
+修改路径：`src/phi0/agent/checkpoints.py` 或 CLI `--pick-checkpoint` / `--throw-checkpoint`。
+
+```bash
+# 全流程：Agent 决策 → SONIC sim mp4（内部调用 run_pick_tissue_sonic_latent_eval.sh）
+CUDA_VISIBLE_DEVICES=4 \
+GT_PANEL_LAYOUT=top ENABLE_G1_DEBUG_OVERLAY=0 \
+bash scripts/run_phi0_agent_zmq_sim_demo.sh \
+  --user-instruction '你可以把沙发上的纸巾拿起来么？' \
+  --episode-idx 447 \
+  --motion-seconds 8 \
+  --out-dir logs/agent_sonic_sim_demo
+
+# 仅 Agent（dry-run，不调 Phi0 predict）
+PYTHONPATH=src python scripts/phi0_langchain_agent_demo.py \
+  --user-instruction '你可以把沙发上的纸巾拿起来么？' \
+  --episode-idx 447 --dry-run
+
+# 跳过 Agent，只测 SONIC 执行
+bash scripts/run_phi0_agent_zmq_sim_demo.sh --force-skill pick_tissues --episode-idx 447
+```
+
+代码入口：`src/phi0/agent/`（`prompts.py` · `robot_agent.py` · `qwen_vl_chat.py` · `checkpoints.py` · `executor.py` · `frames.py`）。
+
+单元测试：`PYTHONPATH=src pytest tests/unit/test_phi0_langchain_agent.py -q`
 
 ---
 
@@ -407,6 +525,9 @@ CUDA_VISIBLE_DEVICES=4 python scripts/vlm_agent_speech_demo.py \
 | `scripts/run_pick_tissue_sonic_latent_eval.sh` | SONIC deploy 开环 eval + mp4 |
 | `scripts/phi0_sonic_latent_zmq_publisher.py` | 推理 / `--precompute-out` / `--precompute-in` / ZMQ |
 | `scripts/run_pick_tissue_hgpt_zmq_eval.sh` | HGPT tracker 开环 eval |
+| `scripts/run_phi0_agent_zmq_sim_demo.sh` | **LangChain Agent → Phi0 → SONIC sim mp4** |
+| `scripts/phi0_langchain_agent_demo.py` | Agent only（无 ZMQ sim） |
+| `scripts/phi0_agent_zmq_sim_demo.py` | 上两者 Python 入口 |
 | `scripts/eval_action.py` | FM chunk MSE（legacy / xperience 配置） |
 | `scripts/eval_visualize_xperience_unified.py` | Xperience unified FK 骨骼 GIF |
 | `scripts/run_eval_visualize_xperience_unified.sh` | 上者 wrapper |
@@ -418,6 +539,7 @@ CUDA_VISIBLE_DEVICES=4 python scripts/vlm_agent_speech_demo.py \
 
 ```bash
 PYTHONPATH=src pytest tests/unit/test_pick_tissue_sonic_latent_pipeline.py -q
+PYTHONPATH=src pytest tests/unit/test_phi0_langchain_agent.py -q
 ```
 
 ---
@@ -430,6 +552,8 @@ PYTHONPATH=src pytest tests/unit/test_pick_tissue_sonic_latent_pipeline.py -q
 | `configs/model/phi0_dual_vggt.yaml` | + VGGT（`dual_vlm_vggt`） |
 | `configs/train_pick_tissue_xperience_unified_ddp4_*.yaml` | pick-tissue 512-d DDP |
 | `configs/train_xperience_unified.yaml` | Xperience 512-d |
+
+Agent 相关：`pyproject.toml` → `[project.optional-dependencies] agent`（`langchain` / `langchain-core`）。
 
 ---
 
@@ -445,6 +569,7 @@ Phi_0/
 │   ├── models/                       # phi0, action_dit, vlm, vggt
 │   ├── data/
 │   ├── inference/
+│   ├── agent/                        # LangChain + 官方 Qwen3-VL + Phi0 tools
 │   ├── deploy/                       # SONIC / HGPT / gripper / GT IO
 │   └── schema/
 ├── checkpoints/                      # gitignore（Psi0 Qwen3-VL 等）
@@ -465,4 +590,5 @@ Phi_0/
 | Lazy GT proprio LUT | ✅ |
 | VGGT dual cross-attn（三塔） | ✅ |
 | VLM Agent 说话（eval 显式开启，首输入单次 `generate`） | ✅ |
+| LangChain Agent → Phi0 skill 路由 → SONIC sim | ✅ |
 | RL / MoE Action Head | 🔜 预留 |

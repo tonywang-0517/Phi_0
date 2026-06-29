@@ -40,6 +40,10 @@ serve = [
   "fastapi>=0.115.0",
   "uvicorn>=0.32.0",
 ]
+agent = [
+  "langchain>=0.3.0",
+  "langchain-core>=0.3.0",
+]
 simple = [
   "lerobot>=0.1.0",
 ]

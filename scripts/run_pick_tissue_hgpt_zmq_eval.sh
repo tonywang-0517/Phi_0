@@ -42,7 +42,7 @@ EPISODE_IDX="${EPISODE_IDX:-}"
 if [[ -n "${MANIFEST_SESSION:-}" && -n "${MANIFEST_EP:-}" ]]; then
   EPISODE_IDX="$(
     PHI0_ROOT="${PHI0_ROOT}" MANIFEST_SESSION="${MANIFEST_SESSION}" MANIFEST_EP="${MANIFEST_EP}" \
-    MANIFEST_PATH="${MANIFEST_PATH:-/mnt/data2/wpy/workspace/Isaac-GR00T/data/data.json}" \
+    MANIFEST_PATH="${MANIFEST_PATH:-/mnt/data2/wpy/workspace/Isaac-GR00T/data/pick_tissues.json}" \
     PICK_TISSUE_VALID="${PICK_TISSUE_VALID:-/mnt/data2/wpy/workspace/Isaac-GR00T/data/pick_tissue_valid}" \
     "${PHI0_PY}" - <<'PY'
 import os, sys
@@ -61,7 +61,9 @@ fi
 EPISODE_ARGS=()
 if [[ -n "${EPISODE_IDX}" ]]; then
   EPISODE_ARGS=(--episode-idx "${EPISODE_IDX}")
-  OUT_MP4="${WORK_DIR}/pick_tissue_ep${EPISODE_IDX}_tracker.mp4"
+  if [[ -z "${OUT_MP4_SET:-}" ]]; then
+    OUT_MP4="${WORK_DIR}/pick_tissue_ep${EPISODE_IDX}_tracker.mp4"
+  fi
 fi
 
 export MUJOCO_GL="${MUJOCO_GL:-egl}"
