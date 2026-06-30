@@ -12,7 +12,7 @@ if [[ ! -x "${PYTHON}" ]]; then
 fi
 
 DATA_ROOT="${DATA_ROOT:-${ISAAC_GR00T}/data}"
-MANIFEST="${MANIFEST:-${DATA_ROOT}/data.json}"
+MANIFEST="${MANIFEST:-${DATA_ROOT}/pick_tissues.json}"
 VALID_ROOT="${VALID_ROOT:-${DATA_ROOT}/pick_tissue_valid}"
 SONIC_ROOT="${SONIC_ROOT:-${DATA_ROOT}/pick_tissue_sonic_unified}"
 MODALITY_CONFIG="${MODALITY_CONFIG:-${ISAAC_GR00T}/examples/G1_SONIC/g1_sonic_ego_left_wrist_config.py}"

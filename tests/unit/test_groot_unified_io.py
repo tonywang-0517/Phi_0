@@ -93,6 +93,14 @@ def test_forward_fill_smpl_keeps_wbc_updates_root():
     assert np.allclose(read_groot_pelvis_world(prepared), [9.0, 9.0, 9.0])
     assert np.allclose(prepared["action.wbc"], invalid_wbc)
 
+    leading_invalid = _teleop_row(wbc=invalid_wbc)
+    leading_invalid["teleop.smpl_frame_index"] = np.array([0], dtype=np.int64)
+    bootstrapped, _, repaired_boot = prepare_groot_row_for_unified(
+        leading_invalid, None, bootstrap_row=valid
+    )
+    assert repaired_boot
+    assert np.allclose(read_groot_pelvis_world(bootstrapped), [9.0, 9.0, 9.0])
+
     gt = pack_from_groot_teleop_row(prepared)
     assert np.allclose(gt.target_root_trans_world, [0.5, 0.5, 0.9])
 

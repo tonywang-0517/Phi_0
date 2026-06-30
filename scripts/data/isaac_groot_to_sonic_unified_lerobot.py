@@ -219,7 +219,7 @@ class SonicUnifiedLeRobotConverter:
             src_ep = int(pq.stem.split("_")[1])
             desc = ep_task.get(src_ep, "")
             task_idx = task_to_idx.get(desc, 0)
-            chunk = f"chunk-{src_ep // chunks_size:03d}"
+            chunk = pq.parent.name
             ep_name = f"episode_{src_ep:06d}.mp4"
             video = data_root / "videos" / chunk / SRC_VIDEO_KEY / ep_name
             if not video.is_file():

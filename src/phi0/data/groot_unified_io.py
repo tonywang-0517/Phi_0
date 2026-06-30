@@ -63,16 +63,22 @@ def forward_fill_smpl_teleop_row(
 def prepare_groot_row_for_unified(
     row: Mapping[str, Any],
     last_valid_row: Mapping[str, Any] | None,
+    *,
+    bootstrap_row: Mapping[str, Any] | None = None,
 ) -> tuple[dict[str, Any], Mapping[str, Any] | None, bool]:
     """Return row ready for packing; forward-fill SMPL when exporter tick was missing.
+
+    ``bootstrap_row`` seeds leading invalid ticks from the first valid SMPL row in the
+    episode (exporter warm-up before the first ZMQ SMPL message).
 
     Returns:
         prepared row dict, updated last_valid_row, whether SMPL was repaired.
     """
     if is_invalid_smpl_teleop_row(row):
-        if last_valid_row is None:
+        seed = last_valid_row if last_valid_row is not None else bootstrap_row
+        if seed is None:
             raise ValueError("first row has invalid SMPL teleop; cannot forward-fill")
-        prepared = forward_fill_smpl_teleop_row(row, last_valid_row)
+        prepared = forward_fill_smpl_teleop_row(row, seed)
         return prepared, last_valid_row, True
     prepared = dict(row)
     return prepared, prepared, False

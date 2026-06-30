@@ -10,7 +10,7 @@ LOG_DIR="${WORK_DIR}/logs"
 mkdir -p "${LOG_DIR}"
 
 PHI0_PY="${PHI0_PY:-/mnt/data/miniconda3/envs/Phi-0-wpy/bin/python}"
-MANIFEST="${MANIFEST:-${ISAAC_ROOT}/data/data.json}"
+MANIFEST="${MANIFEST:-${ISAAC_ROOT}/data/pick_tissues.json}"
 RAW_ROOT="${RAW_ROOT:-${ISAAC_ROOT}/data}"
 VALID_ROOT="${VALID_ROOT:-${ISAAC_ROOT}/data/pick_tissue_valid}"
 UNIFIED_OUT="${UNIFIED_OUT:-${ISAAC_ROOT}/data/pick_tissue_xperience_unified}"

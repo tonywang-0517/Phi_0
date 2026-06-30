@@ -43,6 +43,7 @@ from phi0.data.g1_qpos_teacher import (  # noqa: E402
 )
 from phi0.data.groot_unified_io import (  # noqa: E402
     STATS_SEMANTICS_PICK_TISSUE_UNIFIED,
+    is_invalid_smpl_teleop_row,
     pack_groot_unified_frame_lists,
     prepare_groot_row_for_unified,
 )
@@ -158,13 +159,24 @@ class XperienceUnifiedLeRobotConverter:
         n = len(df)
         assert n > 0, f"empty parquet {src_parquet}"
 
+        bootstrap_row: dict[str, Any] | None = None
+        for i in range(n):
+            raw = df.iloc[i].to_dict()
+            if not is_invalid_smpl_teleop_row(raw):
+                bootstrap_row = raw
+                break
+        if bootstrap_row is None:
+            raise ValueError(f"no valid SMPL teleop in {src_parquet}")
+
         rows: list[dict[str, Any]] = []
         groot_rows: list[dict[str, Any]] = []
         repaired = 0
         last_valid: dict[str, Any] | None = None
         for i in range(n):
             raw = df.iloc[i].to_dict()
-            prepared, last_valid, was_repaired = prepare_groot_row_for_unified(raw, last_valid)
+            prepared, last_valid, was_repaired = prepare_groot_row_for_unified(
+                raw, last_valid, bootstrap_row=bootstrap_row
+            )
             if was_repaired:
                 repaired += 1
             groot_rows.append(prepared)
@@ -238,7 +250,7 @@ class XperienceUnifiedLeRobotConverter:
             src_ep = int(pq.stem.split("_")[1])
             desc = ep_task.get(src_ep, "")
             task_idx = task_to_idx.get(desc, 0)
-            chunk = f"chunk-{src_ep // chunks_size:03d}"
+            chunk = pq.parent.name
             ep_name = f"episode_{src_ep:06d}.mp4"
             video = data_root / "videos" / chunk / SRC_VIDEO_KEY / ep_name
             assert video.is_file(), f"missing source video: {video}"
@@ -390,6 +402,27 @@ class XperienceUnifiedLeRobotConverter:
             json.dump(stats_out, f, indent=2)
 
 
+def _preserve_videos_decoded(out_dir: Path) -> Path | None:
+    """Keep offline-decoded frames across unified rebuild (skip re-decode when unchanged)."""
+    vd = out_dir / "videos_decoded"
+    if not vd.is_dir():
+        return None
+    preserved = out_dir.parent / f".{out_dir.name}_videos_decoded_preserve"
+    if preserved.exists():
+        shutil.rmtree(preserved)
+    shutil.move(str(vd), str(preserved))
+    return preserved
+
+
+def _restore_videos_decoded(out_dir: Path, preserved: Path | None) -> None:
+    if preserved is None or not preserved.is_dir():
+        return
+    dest = out_dir / "videos_decoded"
+    if dest.exists():
+        shutil.rmtree(dest)
+    shutil.move(str(preserved), str(dest))
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
@@ -413,9 +446,11 @@ def main() -> None:
     args = parser.parse_args()
 
     out_dir = args.out_dir
+    preserved_vd = _preserve_videos_decoded(out_dir) if out_dir.exists() else None
     if out_dir.exists():
         shutil.rmtree(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
+    _restore_videos_decoded(out_dir, preserved_vd)
 
     fps = args.fps
     if fps <= 0:
