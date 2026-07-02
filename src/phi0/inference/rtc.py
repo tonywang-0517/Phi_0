@@ -88,3 +88,41 @@ def blend_action_chunks_rtc(
         *([1] * (new_chunk.ndim - 2)), h, 1
     )
     return prev_chunk * m + new_chunk * (1.0 - m)
+
+
+def shift_action_chunk_rtc(chunk: torch.Tensor, steps: int) -> torch.Tensor:
+    """Roll chunk forward by ``steps``; pad tail with last frame (next query time origin)."""
+    s = int(steps)
+    if s <= 0:
+        return chunk
+    if chunk.ndim == 3:
+        c = chunk[0]
+        if s >= c.shape[0]:
+            return c[-1:].expand(c.shape[0], -1).unsqueeze(0)
+        shifted = torch.cat([c[s:], c[-1:].expand(s, -1)], dim=0)
+        return shifted.unsqueeze(0)
+    if s >= chunk.shape[0]:
+        return chunk[-1:].expand(chunk.shape[0], -1)
+    return torch.cat([chunk[s:], chunk[-1:].expand(s, -1)], dim=0)
+
+
+def resolve_rtc_deploy_cfg(
+    cfg,
+    *,
+    rtc_flag: bool = False,
+    inference_delay: int = 0,
+    execution_horizon: int = 0,
+    schedule: str = "",
+) -> dict:
+    """Merge model ``rtc.*`` with CLI overrides (non-zero / explicit flag wins)."""
+    model_rtc = getattr(cfg, "rtc", None) or getattr(getattr(cfg, "model", None), "rtc", None) or {}
+    enabled = bool(getattr(model_rtc, "enabled", False)) or bool(rtc_flag)
+    d = int(inference_delay or getattr(model_rtc, "inference_delay", 2))
+    s = int(execution_horizon or getattr(model_rtc, "execution_horizon", 4))
+    sched = str(schedule or getattr(model_rtc, "schedule", "exponential"))
+    return {
+        "enabled": enabled,
+        "inference_delay": d,
+        "execution_horizon": s,
+        "schedule": sched,
+    }

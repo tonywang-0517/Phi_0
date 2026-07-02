@@ -49,3 +49,25 @@ def test_compute_action_loss_respects_rtc_mask():
     # Row0: only steps 1..3 contribute (3 steps * 3 dims)
     expected = (3 * 3) / (3 * 3)
     assert torch.allclose(loss, torch.tensor(expected))
+
+
+def test_resolve_rtc_deploy_cfg_reads_model_section():
+    from types import SimpleNamespace
+
+    from phi0.inference.rtc import resolve_rtc_deploy_cfg
+
+    cfg = SimpleNamespace(
+        model=SimpleNamespace(
+            rtc=SimpleNamespace(
+                enabled=True,
+                inference_delay=2,
+                execution_horizon=4,
+                schedule="exponential",
+            )
+        )
+    )
+    out = resolve_rtc_deploy_cfg(cfg)
+    assert out["enabled"] is True
+    assert out["inference_delay"] == 2
+    assert out["execution_horizon"] == 4
+    assert out["schedule"] == "exponential"

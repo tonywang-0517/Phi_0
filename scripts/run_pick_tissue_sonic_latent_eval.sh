@@ -88,6 +88,8 @@ VALID_PARQUET="${VALID_PARQUET:-${VALID_ROOT}/data/chunk-000/episode_$(printf '%
 EGO_MP4="${EGO_MP4:-${UNIFIED_ROOT}/videos/chunk-000/observation.images.ego_view/episode_$(printf '%06d' "${UNIFIED_EP}").mp4}"
 WRIST_MP4="${WRIST_MP4:-${UNIFIED_ROOT}/videos/chunk-000/observation.images.left_wrist/episode_$(printf '%06d' "${UNIFIED_EP}").mp4}"
 OUT_MP4="${OUT_MP4:-${WORK_DIR}/pick_tissue_ep${UNIFIED_EP}_sonic_latent_$([ -n "${CHECKPOINT}" ] && echo model || echo gt).mp4}"
+OUT_MP4="$(python3 -c "import os; print(os.path.abspath(os.path.expanduser('${OUT_MP4}')))")"
+mkdir -p "$(dirname "${OUT_MP4}")"
 
 if [[ -n "${MOTION_NPZ:-}" && -f "${MOTION_NPZ}" ]]; then
   _NPZ_FRAMES="$("${PHI0_PY}" - <<PY
@@ -519,15 +521,29 @@ if [[ -n "${MOTION_NPZ:-}" ]]; then
 fi
 
 # ponytail: OpenCV mp4v is unreadable on many players; remux to H.264
+_remux_mp4_h264() {
+  local src="$1"
+  local dst="${src%.mp4}_h264.mp4"
+  if command -v ffmpeg >/dev/null 2>&1 && [[ -f "${src}" ]] && [[ $(stat -c%s "${src}") -gt 1000 ]]; then
+    if ffmpeg -y -loglevel error -i "${src}" \
+      -c:v libx264 -preset fast -crf 23 -pix_fmt yuv420p -movflags +faststart \
+      "${dst}"; then
+      mv "${dst}" "${src}"
+      echo "[sonic_latent] remuxed to H.264 (libx264): ${src}"
+      return 0
+    fi
+  fi
+  return 1
+}
 OUT_H264="${OUT_MP4%.mp4}_h264.mp4"
-if command -v ffmpeg >/dev/null 2>&1 && [[ -f "${OUT_MP4}" ]] && [[ $(stat -c%s "${OUT_MP4}") -gt 1000 ]]; then
-  if ffmpeg -y -loglevel error -i "${OUT_MP4}" \
-    -c:v libx264 -preset fast -crf 23 -pix_fmt yuv420p -movflags +faststart \
-    "${OUT_H264}"; then
-    mv "${OUT_H264}" "${OUT_MP4}"
-    echo "[sonic_latent] remuxed to H.264 (libx264)"
+if [[ ! -f "${OUT_MP4}" ]]; then
+  _rel="${OUT_MP4#${PHI0_ROOT}/}"
+  if [[ -f "${GR00T_ROOT}/${_rel}" ]]; then
+    cp "${GR00T_ROOT}/${_rel}" "${OUT_MP4}"
+    echo "[sonic_latent] copied mp4 from GR00T cwd -> ${OUT_MP4}"
   fi
 fi
+_remux_mp4_h264 "${OUT_MP4}" || true
 
 echo "[sonic_latent] replay tail:"
 tail -8 "${LOG_DIR}/replay.log" || true

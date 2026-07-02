@@ -1293,17 +1293,26 @@ def save_training_checkpoint(
 def run_training(cfg: DictConfig) -> None:
     logging.basicConfig(level=logging.INFO)
     from phi0.distributed import (
-        DistributedContext,
+        cleanup_distributed,
+        distributed_context_from_cfg,
+    )
+
+    dist_ctx = distributed_context_from_cfg(cfg)
+    try:
+        _run_training_loop(cfg, dist_ctx)
+    finally:
+        cleanup_distributed(dist_ctx)
+
+
+def _run_training_loop(cfg: DictConfig, dist_ctx) -> None:
+    from phi0.distributed import (
         barrier,
         configure_logging_for_rank,
-        distributed_context_from_cfg,
         setup_process_device,
         wrap_ddp,
     )
-
     from phi0.training.lr_schedule import apply_warmup_lr, build_lr_scheduler
 
-    dist_ctx: DistributedContext = distributed_context_from_cfg(cfg)
     configure_logging_for_rank(dist_ctx)
     setup_process_device(dist_ctx)
     if dist_ctx.enabled:

@@ -57,6 +57,7 @@ from phi0.deploy.robot_proprio import RobotProprioSource  # noqa: E402
 from phi0.deploy.sonic_zmq_io import unified_action_denorm_to_zmq_arrays  # noqa: E402
 from phi0.schema.unified_action_schema import D_UNIFIED  # noqa: E402
 from phi0.inference.session import ActionInferenceSession, resolve_deploy_action_chunk_size
+from phi0.inference.rtc import resolve_rtc_deploy_cfg, shift_action_chunk_rtc, validate_rtc_params
 from phi0.models.vlm.preprocess import normalize_vlm_instruction
 from phi0.runtime import (  # noqa: E402
     activate_cuda_device,
@@ -93,6 +94,13 @@ class ObsSnapshot:
     ego_hwc: np.ndarray
     wrist_hwc: np.ndarray | None
     timestamp: float
+
+
+@dataclass
+class RtcInferState:
+    """Normalized action chunk from the previous policy query (for deploy RTC blend)."""
+
+    prev_chunk_norm: torch.Tensor | None = None
 
 
 @dataclass
@@ -345,7 +353,7 @@ def parse_args():
     p.add_argument(
         "--config-name",
         type=str,
-        default="train_pick_tissue_xperience_unified_ddp4_3k",
+        default="train_pick_tissue_finetune_rtc_ddp4",
     )
     p.add_argument("--device", type=str, default="cuda")
     p.add_argument("--min-free-gb", type=float, default=12.0)
@@ -459,7 +467,39 @@ def parse_args():
         default="",
         help="Override outputs npz path (default: RECORD_DIR/outputs.npz).",
     )
+    p.add_argument(
+        "--rtc",
+        action="store_true",
+        default=False,
+        help="Enable deploy RTC blend (default: on when model cfg rtc.enabled).",
+    )
+    p.add_argument(
+        "--no-rtc",
+        action="store_true",
+        help="Disable deploy RTC even if model cfg has rtc.enabled.",
+    )
+    p.add_argument("--rtc-inference-delay", type=int, default=0, help="d (0=model cfg)")
+    p.add_argument("--rtc-execution-horizon", type=int, default=0, help="s (0=model cfg)")
+    p.add_argument(
+        "--rtc-schedule",
+        type=str,
+        default="",
+        help="exponential|linear|hard|simple (''=model cfg)",
+    )
     return p.parse_args()
+
+
+def _resolve_rtc_cfg(cfg, args) -> dict:
+    rtc = resolve_rtc_deploy_cfg(
+        cfg,
+        rtc_flag=bool(getattr(args, "rtc", False)),
+        inference_delay=int(getattr(args, "rtc_inference_delay", 0) or 0),
+        execution_horizon=int(getattr(args, "rtc_execution_horizon", 0) or 0),
+        schedule=str(getattr(args, "rtc_schedule", "") or ""),
+    )
+    if bool(getattr(args, "no_rtc", False)):
+        rtc["enabled"] = False
+    return rtc
 
 
 def _resolve_record_paths(args) -> tuple[Path | None, Path | None]:
@@ -625,7 +665,20 @@ def _load_model_bundle(args):
         prompt,
         proprio_source,
     )
-    return model, processor, session, prompt, chunk_h, cfg, proprio_source
+    rtc_cfg = _resolve_rtc_cfg(cfg, args)
+    if rtc_cfg.get("enabled"):
+        validate_rtc_params(
+            chunk_h,
+            int(rtc_cfg["inference_delay"]),
+            int(rtc_cfg["execution_horizon"]),
+        )
+        logger.info(
+            "RTC deploy enabled d=%d s=%d schedule=%s",
+            int(rtc_cfg["inference_delay"]),
+            int(rtc_cfg["execution_horizon"]),
+            rtc_cfg["schedule"],
+        )
+    return model, processor, session, prompt, chunk_h, cfg, proprio_source, rtc_cfg
 
 
 def _build_gt_proprio_source(
@@ -724,6 +777,9 @@ def _predict_chunk(
     get_control_idx: Callable[[], int],
     prompt: str,
     chunk_h: int,
+    rtc_cfg: dict | None = None,
+    rtc_state: RtcInferState | None = None,
+    steps_since_query: int = 0,
     robot_proprio: RobotProprioSource | None = None,
     gt_proprio: GtEpisodeProprioSource | None = None,
     proprio_source: str = "roll-forward",
@@ -765,8 +821,30 @@ def _predict_chunk(
     )
 
     use_amp = model.device.type == "cuda"
+    rtc_on = bool(rtc_cfg and rtc_cfg.get("enabled"))
     with torch.autocast(device_type=model.device.type, dtype=torch.bfloat16, enabled=use_amp):
-        pred = session.predict(int(chunk_h), denormalize=True)
+        if rtc_on and rtc_state is not None and rtc_state.prev_chunk_norm is not None:
+            prev = rtc_state.prev_chunk_norm
+            if int(steps_since_query) > 0:
+                prev = shift_action_chunk_rtc(prev, int(steps_since_query))
+            pred_norm = session.predict_rtc(
+                int(chunk_h),
+                prev,
+                inference_delay=int(rtc_cfg["inference_delay"]),
+                execution_horizon=int(rtc_cfg["execution_horizon"]),
+                schedule=str(rtc_cfg["schedule"]),
+                denormalize=False,
+            )
+        else:
+            pred_norm = session.predict(int(chunk_h), denormalize=False)
+    if rtc_state is not None:
+        rtc_state.prev_chunk_norm = pred_norm.detach().to(dtype=torch.float32)
+    if pred_norm.ndim == 3:
+        pred = processor.postprocess(pred_norm)
+    elif pred_norm.ndim == 2:
+        pred = processor.postprocess(pred_norm.unsqueeze(0)).squeeze(0)
+    else:
+        raise ValueError(f"unexpected pred shape {tuple(pred_norm.shape)}")
     action_denorm = pred.float().detach().cpu().numpy()
     if robot_proprio is not None and proprio_source == "hybrid":
         if action_denorm.ndim == 2:
@@ -802,6 +880,9 @@ def _inference_worker(
     get_control_idx: Callable[[], int],
     prompt: str,
     chunk_h: int,
+    rtc_cfg: dict | None = None,
+    rtc_state: RtcInferState | None = None,
+    steps_since_query: Callable[[], int] | None = None,
     recorder: ClosedLoopRecorder | None = None,
     robot_proprio: RobotProprioSource | None = None,
     gt_proprio: GtEpisodeProprioSource | None = None,
@@ -831,6 +912,7 @@ def _inference_worker(
                         )
                     continue
             t0 = time.monotonic()
+            steps = int(steps_since_query()) if steps_since_query is not None else 0
             result = _predict_chunk(
                 session=session,
                 model=model,
@@ -839,6 +921,9 @@ def _inference_worker(
                 get_control_idx=get_control_idx,
                 prompt=prompt,
                 chunk_h=chunk_h,
+                rtc_cfg=rtc_cfg,
+                rtc_state=rtc_state,
+                steps_since_query=steps,
                 robot_proprio=robot_proprio,
                 gt_proprio=gt_proprio,
                 proprio_source=proprio_source,
@@ -887,7 +972,9 @@ def _sleep_remaining(t_start: float, period: float) -> None:
 
 def run_closed_loop(args) -> None:
     os.chdir(ROOT)
-    model, processor, session, prompt, chunk_h, cfg, proprio_source = _load_model_bundle(args)
+    model, processor, session, prompt, chunk_h, cfg, proprio_source, rtc_cfg = _load_model_bundle(
+        args
+    )
     obs_path, output_path = _resolve_record_paths(args)
     recorder: ClosedLoopRecorder | None = None
     if obs_path is not None and output_path is not None:
@@ -980,6 +1067,11 @@ def run_closed_loop(args) -> None:
             "hybrid",
         } and not bool(args.seed_proprio) and gt_proprio is None
         defer_inference_logged = [False]
+        rtc_state = RtcInferState()
+        steps_since_query = {"n": 0}
+
+        def _steps_since_query() -> int:
+            return int(steps_since_query["n"])
 
         worker = threading.Thread(
             target=_inference_worker,
@@ -995,6 +1087,9 @@ def run_closed_loop(args) -> None:
                 "get_control_idx": _control_idx,
                 "prompt": prompt,
                 "chunk_h": chunk_h,
+                "rtc_cfg": rtc_cfg,
+                "rtc_state": rtc_state,
+                "steps_since_query": _steps_since_query,
                 "recorder": recorder,
                 "robot_proprio": robot_proprio,
                 "gt_proprio": gt_proprio,
@@ -1036,12 +1131,13 @@ def run_closed_loop(args) -> None:
             else f"SONIC live tcp://{args.camera_host}:{args.camera_port}"
         )
         logger.info(
-            "closed loop: camera=%s control=%.1fHz infer<=%.2fHz chunk_h=%d proprio=%s zmq=%s",
+            "closed loop: camera=%s control=%.1fHz infer<=%.2fHz chunk_h=%d proprio=%s rtc=%s zmq=%s",
             cam_mode,
             control_fps,
             float(args.inference_rate),
             chunk_h,
             proprio_source,
+            "on" if rtc_cfg.get("enabled") else "off",
             "on" if zmq_enabled else "off (npz only)",
         )
 
@@ -1062,6 +1158,7 @@ def run_closed_loop(args) -> None:
                     )
                     cached_chunk = chunk
                     last_inference_time = time.monotonic()
+                    steps_since_query["n"] = 0
                     logger.info(
                         "new chunk idx=%d latency=%.3fs token0=%+.3f",
                         action_chunk_index,
@@ -1129,6 +1226,7 @@ def run_closed_loop(args) -> None:
                     )
                 zmq_frame_counter += 1
                 total_frames_sent += 1
+                steps_since_query["n"] += 1
                 action_chunk_index = min(action_chunk_index + 1, action_horizon - 1)
 
                 if total_frames_sent == 1 or total_frames_sent % 50 == 0:

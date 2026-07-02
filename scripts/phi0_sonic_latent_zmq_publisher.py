@@ -49,7 +49,7 @@ from phi0.inference.session import (  # noqa: E402
     PromptEmbedCache,
     resolve_deploy_action_chunk_size,
 )
-from phi0.inference.rtc import create_rtc_soft_mask, validate_rtc_params  # noqa: E402
+from phi0.inference.rtc import create_rtc_soft_mask, resolve_rtc_deploy_cfg, shift_action_chunk_rtc, validate_rtc_params  # noqa: E402
 from phi0.runtime import (  # noqa: E402
     activate_cuda_device,
     apply_processor_stats_from_checkpoint,
@@ -529,14 +529,7 @@ def _load_precompute(path: Path) -> tuple[np.ndarray, np.ndarray, np.ndarray, in
 
 
 def _shift_chunk_rtc(chunk: torch.Tensor, s: int) -> torch.Tensor:
-    """Roll chunk forward by s steps; pad tail with last frame (align prev chunk to next query time)."""
-    # chunk: [H, D]
-    if chunk.ndim == 3:
-        c = chunk[0]
-        shifted = torch.cat([c[s:], c[-1:].expand(s, -1)], dim=0)
-        return shifted.unsqueeze(0)
-    shifted = torch.cat([chunk[s:], chunk[-1:].expand(s, -1)], dim=0)
-    return shifted
+    return shift_action_chunk_rtc(chunk, s)
 
 
 @torch.no_grad()
@@ -853,13 +846,13 @@ def _stream_over_zmq(
 
 
 def _resolve_rtc_cfg(cfg, args) -> dict:
-    """Merge model-cfg rtc.* defaults with CLI overrides. CLI wins when non-default."""
-    model_rtc = getattr(cfg, "rtc", None) or {}
-    enabled = bool(getattr(model_rtc, "enabled", False)) or bool(args.rtc)
-    d = int(args.rtc_inference_delay or getattr(model_rtc, "inference_delay", 2))
-    s = int(args.rtc_execution_horizon or getattr(model_rtc, "execution_horizon", 4))
-    schedule = str(args.rtc_schedule or getattr(model_rtc, "schedule", "exponential"))
-    return {"enabled": enabled, "inference_delay": d, "execution_horizon": s, "schedule": schedule}
+    return resolve_rtc_deploy_cfg(
+        cfg,
+        rtc_flag=bool(args.rtc),
+        inference_delay=int(args.rtc_inference_delay),
+        execution_horizon=int(args.rtc_execution_horizon),
+        schedule=str(args.rtc_schedule),
+    )
 
 
 def main() -> None:

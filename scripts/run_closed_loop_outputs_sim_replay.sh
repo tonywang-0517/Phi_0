@@ -28,8 +28,10 @@ export ENABLE_G1_DEBUG_OVERLAY="${ENABLE_G1_DEBUG_OVERLAY:-0}"
 export RECORD_FPS="${RECORD_FPS:-30}"
 export SIM_WARMUP_S="${SIM_WARMUP_S:-10}"
 export RECORD_SETTLE_S="${RECORD_SETTLE_S:-5}"
-export WORK_DIR="${WORK_DIR:-${PHI0_ROOT}/logs/closed_loop_sim_replay_$(date +%Y%m%d_%H%M%S)}"
-export OUT_MP4="${OUT_MP4:-${WORK_DIR}/closed_loop_replay.mp4}"
+WORK_DIR="${WORK_DIR:-${PHI0_ROOT}/logs/closed_loop_sim_replay_$(date +%Y%m%d_%H%M%S)}"
+export WORK_DIR="$(mkdir -p "${WORK_DIR}" && cd "${WORK_DIR}" && pwd)"
+OUT_MP4="${OUT_MP4:-${WORK_DIR}/closed_loop_replay.mp4}"
+export OUT_MP4="$(python3 -c "import os; print(os.path.abspath('${OUT_MP4}'))")"
 
 FRAMES="$("${PHI0_PY}" - <<PY
 import numpy as np

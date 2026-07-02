@@ -86,6 +86,18 @@ def barrier(dist_ctx: Optional[DistributedContext] = None) -> None:
         dist.barrier()
 
 
+def cleanup_distributed(dist_ctx: Optional[DistributedContext] = None) -> None:
+    """Tear down torch.distributed process group (avoids NCCL exit warning)."""
+    if not dist.is_initialized():
+        return
+    if dist_ctx is None or dist_ctx.enabled:
+        try:
+            dist.barrier()
+        except Exception:
+            logger.debug("barrier during distributed cleanup failed", exc_info=True)
+    dist.destroy_process_group()
+
+
 def unwrap_ddp_module(module: nn.Module) -> nn.Module:
     """Return inner module when wrapped by DDP or ``torch.compile``."""
     from phi0.checkpoint_utils import unwrap_compiled_module

@@ -30,7 +30,7 @@ class EpisodeRolloutConfig:
     """outputs.npz path (observations.npz written alongside if record_dir set)."""
     checkpoint: str
     config_dir: Path = Path("configs")
-    config_name: str = "train_pick_tissue_xperience_unified_ddp4_3k"
+    config_name: str = "train_pick_tissue_finetune_rtc_ddp4"
     prompt: str = "pick tissue"
     device: str = "cuda"
     min_free_gb: float = 12.0

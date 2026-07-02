@@ -31,6 +31,15 @@ def test_unwrap_ddp_module_matches_training_helper():
     assert unwrap_training_module(wrapped) is inner
 
 
+def test_cleanup_distributed_noop_when_not_initialized():
+    from unittest.mock import patch
+
+    from phi0.distributed import cleanup_distributed
+
+    with patch("phi0.distributed.dist.is_initialized", return_value=False):
+        cleanup_distributed()  # should not raise
+
+
 def test_distributed_context_device():
     ctx = DistributedContext(enabled=True, rank=2, world_size=4, local_rank=2)
     assert ctx.device == "cuda:2"

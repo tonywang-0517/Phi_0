@@ -44,19 +44,19 @@ Cross-attn 模式（`action_cross_attn_mode`）：
 
 ## Eval 效果（pick-tissue SONIC）
 
-`pick_tissue_xperience_unified_3k_ddp4_fast` 在默认 eval clip **ep447** 上的开环 SONIC deploy（上：ego + 左腕 GT 视频；下：MuJoCo sim + TensorRT deploy + Dex3 三指夹爪）：
+`pick_tissue_xperience_unified_3k_ddp4_fast` 在默认 eval clip **ep447** 上的 **开环** SONIC deploy 录屏（历史参考；**日常验证请走 §3 闭环**）：
 
 <p align="center">
   <img src="assets/pick_tissue_ep447_sonic_latent_eval.gif" alt="Pick-tissue ep447 SONIC latent eval" width="90%">
 </p>
 
-生成命令见下文 [Pick-tissue 工作流 §3](#3-sonic-开环-eval--录-mp4推荐含三指夹爪)；录屏来源：`logs/pick_tissue_finetune/sonic_latent_model_<ts>/pick_tissue_ep447_sonic_latent_model.mp4`。
+上图对应 [§3c 开环 eval（legacy）](#3c-sonic-开环-eval--legacy--debug)；**checkpoint 验收与横向对比**请用 [§3 闭环 eval](#3-sonic-闭环-eval推荐默认验证路径)。
 
 ---
 
 ## Eval 效果（LangChain Agent → Phi0 → SONIC sim）
 
-用户说：**「你可以把沙发上的纸巾拿起来么？」**；官方 **Qwen3-VL-2B-Instruct**（LangChain + tool calling）结合 ep447 **ego + 左腕**画面理解意图并中文回复；选中 `pick_tissues` 后走与 §3 **相同的 SONIC latent 开环管线**（publisher **在线加载 VLM+Phi0 推理** dataset clip → ZMQ v4 → TensorRT deploy + Dex3 + MuJoCo 录屏）。
+用户说：**「你可以把沙发上的纸巾拿起来么？」**；官方 **Qwen3-VL-2B-Instruct**（LangChain + tool calling）结合 ep447 **ego + 左腕**画面理解意图并中文回复；选中 `pick_tissues` 后当前仍走 **开环** SONIC 管线（`run_pick_tissue_sonic_latent_eval.sh`）。**Phi0 action 技能的标准 eval 见 §3 闭环**；Agent 执行路径后续可对齐闭环。
 
 <p align="center">
   <img src="assets/agent_pick_tissues_ep447_demo.gif" alt="LangChain agent pick tissues ep447 SONIC sim" width="90%">
@@ -76,7 +76,7 @@ Cross-attn 模式（`action_cross_attn_mode`）：
 | 语言 | `Qwen/Qwen3-VL-2B-Instruct` | Psi0 内嵌 VLM **无语言能力**，Agent 必须用官方权重 |
 | 技能 | `pick_tissues` / `throw_rubbish` / `stay` | 映射 Phi0 prompt：`pick tissue` / `throw rubbish`；`stay` 不调 Phi0 |
 | 权重路由 | `src/phi0/agent/checkpoints.py` | 每 skill 独立 ckpt；`throw_rubbish` 占位路径，训好只改路径 |
-| 执行 | `run_pick_tissue_sonic_latent_eval.sh` | 与 §3 相同；**不是** HGPT tracker 线 |
+| 执行 | `run_pick_tissue_sonic_latent_eval.sh` | 当前 Agent demo 仍用开环；policy eval 推荐 §3 闭环 |
 
 **已测产物**（ep447，`MOTION_SECONDS=8`）：
 
@@ -228,16 +228,39 @@ Checkpoint：`experiments/<name>/<name>_latest.pt`（可 `save_action_expert_onl
 
 ### Eval / 可视化
 
+**Pick-tissue SONIC（推荐：闭环）**
+
+```bash
+# ① 离线闭环 rollout → outputs.npz（GT 相机 + 按 inference_rate 在线 re-infer）
+CHECKPOINT=experiments/.../pick_tissue_valid_wholebody_rtc_act_latest.pt \
+CONFIG_NAME=train_pick_tissue_finetune_rtc_ddp4 \
+bash scripts/run_closed_loop_episode_rollout.sh 447 logs/ep447_closed_loop/outputs.npz
+
+# ② 闭环轨迹 → MuJoCo sim + deploy 录 mp4（GT_PANEL_LAYOUT=sim）
+bash scripts/run_closed_loop_outputs_sim_replay.sh logs/ep447_closed_loop/outputs.npz
+```
+
+**Sim / 真机在线闭环 ZMQ**（camera + g1_debug proprio → 异步 re-infer → ZMQ v4）：
+
+```bash
+# 先起 sim + deploy（真机则起 composed_camera + deploy），再：
+CAMERA_SOURCE=gt GT_CAMERA_EP=447 PROPRIO_SOURCE=robot \
+CHECKPOINT=... CONFIG_NAME=... \
+bash scripts/run_phi0_sonic_closed_loop.sh
+```
+
+**其它**
+
 ```bash
 python scripts/eval_action.py --checkpoint ... --config-name train_xperience_unified
 bash scripts/run_eval_visualize_xperience_unified.sh
-bash scripts/run_pick_tissue_sonic_latent_eval.sh   # SONIC deploy + mp4
-bash scripts/run_phi0_agent_zmq_sim_demo.sh         # LangChain Agent + SONIC（见 §7）
+bash scripts/run_pick_tissue_sonic_latent_eval.sh   # 开环 legacy / debug（§3c）
+bash scripts/run_phi0_agent_zmq_sim_demo.sh         # LangChain Agent + SONIC（§7）
 ```
 
 ### Deploy
 
-Legacy 256-d JSONL deploy 仍可用；pick-tissue **推荐 SONIC**（§3 / §7）；HGPT tracker 见 §4。
+Pick-tissue **推荐 SONIC 闭环**（§3）；开环 precompute 见 §3c legacy；HGPT tracker 见 §4。
 
 ---
 
@@ -369,60 +392,90 @@ bash scripts/run_train_pick_tissue_xperience_unified_ddp4_23k.sh  # 续训 23k
 
 Checkpoint 示例：`experiments/pick_tissue_xperience_unified_3k_ddp4_fast/pick_tissue_xperience_unified_act_latest.pt`
 
-### 3. SONIC 开环 eval + 录 mp4（**推荐**，含三指夹爪）
+### 3. SONIC 闭环 eval（**推荐**，默认验证路径）
 
-**默认 eval clip**：unified `episode_index=447`（manifest ep2，~831 帧 @50 Hz，task=`pick tissue`）。SONIC / HGPT / Agent demo 均以此为准，便于横向对比。
+**默认 eval clip**：unified `episode_index=447`（manifest ep2，~831 帧 @50 Hz，task=`pick tissue`）。
 
-两阶段：离线 precompute（VLM 推理 → npz）→ sim + TensorRT deploy + ZMQ v4 流式回放。
+与开环（整段 clip 预推理 + GT proprio LUT）不同，闭环 eval **按 control_fps 逐帧推 ZMQ**，并在 `inference_rate`（默认 **2.5 Hz**）触发 **在线 re-infer**；proprio 来自 deploy **g1_debug**（5557）或 hybrid / roll-forward。与 ACT+RTC 训练语义一致。
+
+#### 3a. 离线闭环 rollout → sim 录 mp4（**日常验收推荐**）
+
+两阶段：先在 dataset 时间轴上跑闭环 policy（写 `outputs.npz`），再把轨迹送进 MuJoCo + TensorRT deploy 录屏。
 
 ```bash
-# 模型 eval，ep447，top panel 无 marker，全 episode
-CHECKPOINT=/mnt/data2/wpy/workspace/Phi_0/experiments/pick_tissue_xperience_unified_3k_ddp4_fast/pick_tissue_xperience_unified_act_latest.pt \
+# Stage 1：闭环 rollout（无 ZMQ，输出 tokens + obs trace）
+CHECKPOINT=experiments/pick_tissue_valid_wholebody_rtc_8k_ddp4/pick_tissue_valid_wholebody_rtc_act_latest.pt \
+CONFIG_NAME=train_pick_tissue_finetune_rtc_ddp4 \
+INFERENCE_RATE=2.5 \
+bash scripts/run_closed_loop_episode_rollout.sh 447 logs/ep447_closed_loop/outputs.npz
+
+# Stage 2：闭环 npz → sim + deploy → mp4（MuJoCo 相机，非 GT 贴片）
+bash scripts/run_closed_loop_outputs_sim_replay.sh logs/ep447_closed_loop/outputs.npz
+```
+
+| 变量 | 默认 | 说明 |
+|------|------|------|
+| `INFERENCE_RATE` | 2.5 Hz | 与 SONIC `should_trigger_new_inference` 对齐 |
+| `MOTION_SECONDS` | 0 | 0 = 跑满 episode |
+| `GT_PANEL_LAYOUT` | `sim` | Stage 2 用 MuJoCo 相机 |
+| RTC | `CONFIG_NAME=*rtc*` | 读 model cfg；开环回放也可 `USE_RTC=1` |
+
+解码 / 对比：`python scripts/decode_closed_loop_npz.py logs/ep447_closed_loop/outputs.npz`
+
+#### 3b. 在线真·闭环 ZMQ（sim 或真机）
+
+**前提**：`gear_sonic_deploy` 已编译；ZMQ **5556**（motion）+ **5557**（g1_debug state）。
+
+**Sim**：先起 MuJoCo sim + deploy（可参考 §3c 开环脚本启 sim/deploy，再换闭环 publisher）。
+
+**真机**：SONIC `composed_camera` @5555 + 真机 deploy（§5）。
+
+```bash
+# GT 相机 + sim/真机 g1_debug proprio（sim eval 常用）
+CAMERA_SOURCE=gt GT_CAMERA_EP=447 PROPRIO_SOURCE=robot \
+CHECKPOINT=experiments/pick_tissue_valid_wholebody_rtc_8k_ddp4/pick_tissue_valid_wholebody_rtc_act_latest.pt \
+CONFIG_NAME=train_pick_tissue_finetune_rtc_ddp4 \
+INFERENCE_RATE=2.5 STREAM_NOW=1 \
+bash scripts/run_phi0_sonic_closed_loop.sh
+
+# 真机 live 相机
+CAMERA_SOURCE=live CAMERA_HOST=192.168.123.165 PROPRIO_SOURCE=robot \
+bash scripts/run_phi0_sonic_closed_loop.sh
+```
+
+| 模式 | `CAMERA_SOURCE` | `PROPRIO_SOURCE` | 场景 |
+|------|-----------------|------------------|------|
+| Sim 闭环 | `gt` | `robot` | deploy 发 g1_debug，相机读 dataset |
+| 真机闭环 | `live` | `robot` | composed_camera + 真机 deploy |
+| 纯 policy 调试 | `gt` | `roll-forward` | 无 5557 时 |
+
+录 trace：`RECORD_DIR=logs/my_run bash scripts/run_phi0_sonic_closed_loop.sh`
+
+Deploy 键盘（默认）：`k` 控制环 · `]` 开流 · `p` planner · `O` 急停 · `h` 帮助
+
+---
+
+### 3c. SONIC 开环 eval + 录 mp4（legacy / debug）
+
+整段 clip **离线 precompute**（VLM + GT proprio LUT）→ 按 50 Hz **replay** ZMQ。**不用于 checkpoint 正式验收**；适合 GT 对照、smoke、Agent demo 录屏。
+
+```bash
+CHECKPOINT=experiments/pick_tissue_xperience_unified_3k_ddp4_fast/pick_tissue_xperience_unified_act_latest.pt \
 CONFIG_NAME=train_pick_tissue_xperience_unified_ddp4_3k \
-UNIFIED_EP=447 \
-GT_PANEL_LAYOUT=top \
-ENABLE_G1_DEBUG_OVERLAY=0 \
-MOTION_SECONDS=20 \
-CUDA_VISIBLE_DEVICES=4 \
+UNIFIED_EP=447 GT_PANEL_LAYOUT=top ENABLE_G1_DEBUG_OVERLAY=0 MOTION_SECONDS=20 \
 bash scripts/run_pick_tissue_sonic_latent_eval.sh
 
-# GT 对照（不设 CHECKPOINT）
-GT_PANEL_LAYOUT=top ENABLE_G1_DEBUG_OVERLAY=0 UNIFIED_EP=447 MOTION_SECONDS=20 \
+# RTC 开环（config 含 rtc 自动 --rtc）
+CHECKPOINT=experiments/pick_tissue_valid_wholebody_rtc_8k_ddp4/pick_tissue_valid_wholebody_rtc_act_latest.pt \
+CONFIG_NAME=train_pick_tissue_finetune_rtc_ddp4 USE_RTC=1 \
 bash scripts/run_pick_tissue_sonic_latent_eval.sh
 ```
 
-**仅离线 precompute（不启 sim/deploy）：**
+**仅 precompute：** `python scripts/phi0_sonic_latent_zmq_publisher.py --precompute-out logs/ep447.npz ...`
 
-```bash
-python scripts/phi0_sonic_latent_zmq_publisher.py \
-  --checkpoint /path/to.ckpt \
-  --config-name train_pick_tissue_xperience_unified_ddp4_3k \
-  --episode-idx 447 \
-  --motion-seconds 20 \
-  --precompute-out logs/ep447_precompute.npz \
-  --device cuda
-```
+**npz 重放：** `MOTION_NPZ=logs/.../outputs.npz bash scripts/run_pick_tissue_sonic_latent_eval.sh` 或 `replay_sonic_latent_npz_zmq_v4.py`
 
-输出默认：`logs/pick_tissue_finetune/sonic_latent_model_<ts>/pick_tissue_ep447_sonic_latent_model.mp4`
-
-| 可视化 | 环境变量 |
-|--------|----------|
-| top panel + 无 marker（推荐） | `GT_PANEL_LAYOUT=top ENABLE_G1_DEBUG_OVERLAY=0` |
-| inset + debug marker | 脚本默认 |
-| 默认推理 | publisher 启动时 inline 加载 VLM+Phi0 |
-| 复用 npz | `FORCE_PRECOMPUTE=1` 或 `--precompute-in` / `PRECOMPUTE_IN=...` |
-| 录屏 flag | `WORK_DIR` 自动 `cd` 为绝对路径（勿用手写相对路径跨 `Phi_0` / `GR00T`） |
-
-**从 npz 重放 ZMQ（不加载 VLM，调试用）：**
-
-```bash
-python scripts/phi0_sonic_latent_zmq_publisher.py \
-  --precompute-in logs/pick_tissue_finetune/sonic_latent_model_<ts>/sonic_latent_precompute.npz \
-  --config-name train_pick_tissue_xperience_unified_ddp4_3k \
-  --episode-idx 447 \
-  --zmq-port 5556 \
-  --control-fps 50
-```
+`run_pick_tissue_sonic_latent_eval.sh` 会将 `WORK_DIR` resolve 为绝对路径；publisher 在 deploy 站稳且 `sim_record` 启动后才收到 `.replay_go`（默认 timeout 900s）。
 
 ### 4. Humanoid-GPT ZMQ eval（tracker sim，**无** Dex3 手模）
 
@@ -433,51 +486,38 @@ CHECKPOINT=/path/to.ckpt EPISODE_IDX=447 USE_GT=0 DEPLOY_MODE=smpl \
 CUDA_VISIBLE_DEVICES=4 bash scripts/run_pick_tissue_hgpt_zmq_eval.sh
 ```
 
-### 5. 真机 SONIC 开环 deploy（ZMQ v4）
+### 5. 真机 SONIC 闭环 deploy（ZMQ v4，**推荐**）
 
-与 §3 相同数据路径（`phi0_sonic_latent_zmq_publisher.py` → ZMQ **5556** → `g1_deploy_onnx_ref --input-type zmq_manager`），**去掉 MuJoCo sim 与 mp4 录屏**，在 G1 真机上执行 precompute 轨迹。
-
-> **开环**：precompute 使用数据集 ep447 的 ego/wrist 视频 + GT proprio LUT，**非**机载相机闭环。真机闭环需另接 camera server（5555）与在线推理，见 `GR00T-WholeBodyControl/G1_VISION_TO_GR00T.md`。
+与 §3b 相同栈：`phi0_sonic_closed_loop_zmq.py` → ZMQ **5556** ← `g1_deploy_onnx_ref --input-type zmq_manager`；state 回读 **5557**（g1_debug）。
 
 **前提**：`gear_sonic_deploy` 已编译；控制机与 G1 同网（`192.168.123.x`）；真机 deploy **不要**加 `--disable-crc-check`。
 
-**Step 0 — 离线 precompute（可与 sim eval 复用同一 npz）：**
-
-```bash
-python scripts/phi0_sonic_latent_zmq_publisher.py \
-  --checkpoint experiments/pick_tissue_xperience_unified_3k_ddp4_fast/pick_tissue_xperience_unified_act_latest.pt \
-  --config-name train_pick_tissue_xperience_unified_ddp4_3k \
-  --episode-idx 447 \
-  --control-fps 50 \
-  --motion-seconds 16.62 \
-  --precompute-out /tmp/ep447_precompute.npz \
-  --device cuda
-```
-
-**Step 1 — Terminal A：真机 C++ deploy**（`GR00T-WholeBodyControl/gear_sonic_deploy`）：
+**Terminal A — 真机 deploy**（`GR00T-WholeBodyControl/gear_sonic_deploy`）：
 
 ```bash
 source scripts/setup_env.sh
 ./deploy.sh --input-type zmq_manager real --zmq-host 127.0.0.1 --zmq-port 5556
-# Init Done 后：] 启动控制 → ENTER（ZMQ STREAMING MODE: ENABLED）→ I 站稳；O 急停
+# Init Done 后：] 启动控制 + 开流；或闭环脚本 STREAM_NOW=1 自动发 start
 ```
 
-publisher 在另一台机器时，将 `--zmq-host` 改为 publisher 所在 IP。
-
-**Step 2 — Terminal B：ZMQ 推流**（deploy 已进入 streaming 且站稳后）：
+**Terminal B — SONIC 相机**（G1 上或同网机）：
 
 ```bash
-cd Phi_0
-python scripts/phi0_sonic_latent_zmq_publisher.py \
-  --precompute-in /tmp/ep447_precompute.npz \
-  --config-name train_pick_tissue_xperience_unified_ddp4_3k \
-  --episode-idx 447 \
-  --zmq-port 5556 \
-  --control-fps 50 \
-  --motion-seconds 16.62
+python -m gear_sonic.camera.composed_camera --port 5555
 ```
 
-可选：用 `--arm-flag` / `--ready-flag` 与 sim eval 脚本同样的时序协调（见 `run_pick_tissue_sonic_latent_eval.sh`）。
+**Terminal C — Phi0 闭环 publisher**：
+
+```bash
+CAMERA_SOURCE=live CAMERA_HOST=192.168.123.165 PROPRIO_SOURCE=robot \
+CHECKPOINT=experiments/.../pick_tissue_valid_wholebody_rtc_act_latest.pt \
+CONFIG_NAME=train_pick_tissue_finetune_rtc_ddp4 \
+bash scripts/run_phi0_sonic_closed_loop.sh
+```
+
+连接检查：`bash scripts/run_phi0_sonic_deploy_connect.sh`
+
+> **Legacy 开环真机**（precompute npz 回放、无相机闭环）仍可用 `phi0_sonic_latent_zmq_publisher.py --precompute-in ...`；仅作 smoke，不作正式验收。
 
 ### 6. VLM Agent 说话 demo（eval 可选，与 action 解耦）
 
@@ -542,8 +582,16 @@ bash scripts/run_phi0_agent_zmq_sim_demo.sh --force-skill pick_tissues --episode
 | `scripts/run_pick_tissue_from_raw_rebuild_eval.sh` | raw → valid → unified → smoke eval |
 | `scripts/rebuild_pick_tissue_finetune_data.sh` | valid → **sonic 43s/100a** 格式（Pi0.5 线） |
 | `scripts/run_train_pick_tissue_xperience_unified_ddp4_*.sh` | pick-tissue DDP 训练 |
-| `scripts/run_pick_tissue_sonic_latent_eval.sh` | SONIC deploy 开环 eval + mp4 |
-| `scripts/phi0_sonic_latent_zmq_publisher.py` | 推理 / `--precompute-out` / `--precompute-in` / ZMQ |
+| `scripts/run_closed_loop_episode_rollout.sh` | **闭环 rollout** → `outputs.npz`（默认 eval Stage 1） |
+| `scripts/run_closed_loop_outputs_sim_replay.sh` | 闭环 npz → sim + deploy 录 mp4（Stage 2） |
+| `scripts/run_phi0_sonic_closed_loop.sh` | **真·闭环 ZMQ**（live/GT cam + g1_debug proprio） |
+| `scripts/phi0_sonic_closed_loop_zmq.py` | 闭环核心（异步 infer + latency comp） |
+| `scripts/decode_closed_loop_npz.py` | 解码 / 对比闭环 npz |
+| `scripts/run_pick_tissue_sonic_latent_eval.sh` | 开环 eval + mp4（legacy §3c） |
+| `scripts/replay_sonic_latent_npz_zmq_v4.py` | 任意 motion npz → ZMQ replay |
+| `scripts/phi0_sonic_latent_zmq_publisher.py` | 开环推理 / precompute / ZMQ |
+| `scripts/run_phi0_sonic_deploy_connect.sh` | 真机 ZMQ 连通性检查 |
+| `scripts/setup_env.sh` | 统一 `PHI0_ROOT` / TensorRT / GR00T 路径 |
 | `scripts/run_pick_tissue_hgpt_zmq_eval.sh` | HGPT tracker 开环 eval |
 | `scripts/run_phi0_agent_zmq_sim_demo.sh` | **LangChain Agent → Phi0 → SONIC sim mp4** |
 | `scripts/phi0_langchain_agent_demo.py` | Agent only（无 ZMQ sim） |
@@ -553,7 +601,7 @@ bash scripts/run_phi0_agent_zmq_sim_demo.sh --force-skill pick_tissues --episode
 | `scripts/run_eval_visualize_xperience_unified.sh` | 上者 wrapper |
 | `scripts/run_train_xperience_unified_ddp4.sh` | Xperience 512-d 训练 |
 
-**Deploy 核心模块**（`src/phi0/deploy/`）：`gt_io.py`（Lazy GT LUT）、`sonic_zmq_io.py`、`dex3_gripper.py`、`ref_traj_builder.py`、`sonic_latent_gt_replay.py`。
+**Deploy 核心模块**（`src/phi0/deploy/`）：`gt_io.py`、`robot_proprio.py`（g1_debug→512-d）、`deploy_keyboard.py`、`sonic_zmq_io.py`、`dex3_gripper.py`、`ref_traj_builder.py`、`sonic_latent_gt_replay.py`。
 
 **单元测试：**
 
@@ -605,7 +653,8 @@ Phi_0/
 | Qwen3-VL observation tower + ACT/FM action 头 | ✅ |
 | Keypoints D_raw 256 + dim mask | ✅ |
 | Unified 512-d（Xperience / `g1_sonic`） | ✅ |
-| Pick-tissue + SONIC latent deploy eval | ✅ |
+| Pick-tissue + SONIC **闭环** eval（rollout / live ZMQ） | ✅ |
+| Pick-tissue + SONIC 开环 eval（legacy） | ✅ |
 | Phi-0 → HGPT ZMQ eval | ✅ |
 | Lazy GT proprio LUT | ✅ |
 | VGGT dual cross-attn（三塔） | ✅ |
