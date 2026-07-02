@@ -14,23 +14,13 @@ from torch.utils.data import Dataset
 from phi0.data.video_cache import preload_mp4_frames
 from phi0.data.cosmos_video_size import DEFAULT_COSMOS_VIDEO_SIZE
 from phi0.data.xperience_unified_gt import pack_xperience_unified_frame_gt
+from phi0.paths import workspace_root
 from phi0.schema.draw_schema import D_RAW, DrawLayout, pack_xperience_keypoints
 from phi0.schema.unified_action_schema import D_UNIFIED, dim_mask_for_dataset
 
-DEFAULT_HDF5 = Path(
-    "/mnt/data2/wpy/workspace/Isaac-GR00T/demo_data/xperience-10m-sample/annotation.hdf5"
-)
-DEFAULT_VIDEO = Path(
-    "/mnt/data2/wpy/workspace/Isaac-GR00T/demo_data/xperience-10m-sample/stereo_left.mp4"
-)
-if not DEFAULT_HDF5.exists():
-    DEFAULT_HDF5 = Path(
-        "/mnt/data1/wpy/workspace/Isaac-GR00T/demo_data/xperience-10m-sample/annotation.hdf5"
-    )
-if not DEFAULT_VIDEO.exists():
-    DEFAULT_VIDEO = Path(
-        "/mnt/data1/wpy/workspace/Isaac-GR00T/demo_data/xperience-10m-sample/stereo_left.mp4"
-    )
+_DEMO = workspace_root() / "Isaac-GR00T/demo_data/xperience-10m-sample"
+DEFAULT_HDF5 = _DEMO / "annotation.hdf5"
+DEFAULT_VIDEO = _DEMO / "stereo_left.mp4"
 
 
 def resolve_xperience_video_path(explicit: str | Path | None = None) -> Path | None:

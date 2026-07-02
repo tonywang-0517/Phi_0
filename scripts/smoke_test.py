@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import os
 import sys
 import tempfile
 from pathlib import Path
@@ -10,8 +11,9 @@ from pathlib import Path
 import torch
 
 ROOT = Path(__file__).resolve().parents[1]
+_WORKSPACE = Path(os.environ.get("PHI0_WORKSPACE", "/home/user"))
 sys.path.insert(0, str(ROOT / "src"))
-sys.path.insert(0, str(Path("/mnt/data2/wpy/workspace/FastWAM/src")))
+sys.path.insert(0, str(_WORKSPACE / "FastWAM/src"))
 
 from phi0.data.egodex import EgoDexDataset
 from phi0.data.processor import Phi0Processor, build_overfit_datasets

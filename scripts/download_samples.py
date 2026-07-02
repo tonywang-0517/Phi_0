@@ -13,7 +13,7 @@ import requests
 from huggingface_hub import hf_hub_url
 
 ROOT = Path(__file__).resolve().parents[1]
-WORKSPACE = Path(os.environ.get("PHI0_WORKSPACE", "/mnt/data2/wpy/workspace"))
+WORKSPACE = Path(os.environ.get("PHI0_WORKSPACE", "/home/user"))
 HF_BASE = "https://huggingface.co/datasets/ropedia-ai/xperience-10m-sample/resolve/main"
 XPERIENCE_DIR = WORKSPACE / "Isaac-GR00T/demo_data/xperience-10m-sample"
 EGODEX_DIR = WORKSPACE / "Isaac-GR00T/demo_data/egodex/test/add_remove_lid"

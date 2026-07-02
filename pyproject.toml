@@ -45,7 +45,7 @@ agent = [
   "langchain-core>=0.3.0",
 ]
 simple = [
-  "lerobot>=0.1.0",
+  "lerobot>=0.3.0,<0.4.0",
 ]
 viz = [
   "smplx>=0.1.28",

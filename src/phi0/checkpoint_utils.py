@@ -9,13 +9,26 @@ import torch
 import torch.nn as nn
 from omegaconf import DictConfig, ListConfig, OmegaConf
 
+from phi0.paths import remap_workspace_path
+
 logger = logging.getLogger(__name__)
+
+
+def _remap_workspace_paths_obj(obj: Any) -> Any:
+    if isinstance(obj, dict):
+        return {k: _remap_workspace_paths_obj(v) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [_remap_workspace_paths_obj(v) for v in obj]
+    if isinstance(obj, str) and obj.startswith("/mnt/data2/wpy/workspace"):
+        return remap_workspace_path(obj)
+    return obj
 
 
 def merge_saved_cfg(cfg: DictConfig, saved: Optional[Dict[str, Any]]) -> DictConfig:
     """Merge full checkpoint ``cfg`` into Hydra-composed config (saved wins on conflict)."""
     if not saved:
         return cfg
+    saved = _remap_workspace_paths_obj(saved)
     saved_cfg = OmegaConf.create(saved)
     # Drop keys removed from current schema (e.g. deprecated latent_cache_path).
     if OmegaConf.is_config(cfg):

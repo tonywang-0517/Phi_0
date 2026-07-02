@@ -33,4 +33,4 @@ learning_rate_scheduler: cosine
 data:
   seq_len: 33
   auto_compute_action_stats: true
-  action_stats_path: /mnt/data2/wpy/workspace/Isaac-GR00T/data/pick_tissue_xperience_unified/meta/stats_pick_tissue_unified.json
+  action_stats_path: ${oc.env:PHI0_WORKSPACE,/home/user}/Isaac-GR00T/data/pick_tissue_xperience_unified/meta/stats_pick_tissue_unified.json

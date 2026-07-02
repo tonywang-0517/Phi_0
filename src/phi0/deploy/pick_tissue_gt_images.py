@@ -22,6 +22,7 @@ from phi0.data.predecoded_video import (
 )
 from phi0.data.psi0_image import read_lerobot_video_hw
 from phi0.models.vlm.preprocess import make_psi0_vlm_image_transform
+from phi0.paths import workspace_root
 
 ViewFitMode = Literal["letterbox_raw", "model_input"]
 
@@ -197,7 +198,7 @@ def reader_from_meta(
     view_fit: ViewFitMode = "letterbox_raw",
 ) -> PickTissuePredecodedReader:
     root = str(
-        meta.get("pick_tissue_root", "/mnt/data2/wpy/workspace/Isaac-GR00T/data")
+        meta.get("pick_tissue_root", f"{workspace_root()}/Isaac-GR00T/data")
     )
     repo = str(meta.get("pick_tissue_repo_id", "pick_tissue_xperience_unified"))
     return _cached_predecoded_reader(root, repo, view_fit)
