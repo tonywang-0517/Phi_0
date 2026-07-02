@@ -48,6 +48,19 @@ from phi0.schema.unified_action_schema import D_UNIFIED
 logger = logging.getLogger(__name__)
 
 
+def _apply_rtc_config(model: Phi0, model_cfg: DictConfig) -> None:
+    rtc_cfg = model_cfg.get("rtc")
+    if rtc_cfg is None:
+        return
+    model.configure_rtc(
+        enabled=bool(getattr(rtc_cfg, "enabled", False)),
+        max_delay=int(getattr(rtc_cfg, "max_delay", 8)),
+        inference_delay=int(getattr(rtc_cfg, "inference_delay", 2)),
+        execution_horizon=int(getattr(rtc_cfg, "execution_horizon", 4)),
+        schedule=str(getattr(rtc_cfg, "schedule", "exponential")),
+    )
+
+
 def _resolve_raw_action_dim(model_cfg, data_cfg=None) -> int:
     robot_dim = int(model_cfg.get("robot_action_dim", 0))
     if robot_dim > 0:
@@ -349,6 +362,7 @@ def create_phi0(cfg: DictConfig, smoke: bool = False) -> Phi0:
             model.robot_action_loss_type = str(
                 model_cfg.get("robot_action_loss_type", "l1")
             ).strip().lower()
+        _apply_rtc_config(model, model_cfg)
         torch.set_grad_enabled(True)
         _log_trainable_scope(model)
         return model
@@ -390,6 +404,7 @@ def create_phi0(cfg: DictConfig, smoke: bool = False) -> Phi0:
         model.robot_action_loss_type = str(
             model_cfg.get("robot_action_loss_type", "l1")
         ).strip().lower()
+    _apply_rtc_config(model, model_cfg)
     # Importing diffusers can leave grad disabled globally.
     torch.set_grad_enabled(True)
     _log_trainable_scope(model)

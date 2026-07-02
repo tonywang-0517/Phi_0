@@ -28,6 +28,7 @@ loss:
 
 rtc:
   enabled: false
+  max_delay: 8
   inference_delay: 2
   execution_horizon: 4
   schedule: exponential

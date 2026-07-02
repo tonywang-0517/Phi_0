@@ -135,6 +135,11 @@ class Phi0(torch.nn.Module):
             if self.action_head == "fm"
             else None
         )
+        self.rtc_enabled = False
+        self.rtc_max_delay = 8
+        self.rtc_inference_delay = 2
+        self.rtc_execution_horizon = 4
+        self.rtc_schedule = "exponential"
         _norm_dim = int(getattr(action_expert, "raw_action_dim", D_RAW))
         self.register_buffer("action_norm_mean", torch.zeros(_norm_dim), persistent=False)
         self.register_buffer("action_norm_std", torch.ones(_norm_dim), persistent=False)
@@ -570,12 +575,47 @@ class Phi0(torch.nn.Module):
             return (~pad).to(dtype=dtype).unsqueeze(0)
         return (~pad).to(dtype=dtype)
 
+    def configure_rtc(
+        self,
+        *,
+        enabled: bool = False,
+        max_delay: int = 8,
+        inference_delay: int = 2,
+        execution_horizon: int = 4,
+        schedule: str = "exponential",
+    ) -> None:
+        self.rtc_enabled = bool(enabled)
+        self.rtc_max_delay = max(1, int(max_delay))
+        self.rtc_inference_delay = max(1, int(inference_delay))
+        self.rtc_execution_horizon = max(1, int(execution_horizon))
+        self.rtc_schedule = str(schedule)
+
+    def _rtc_postfix_mask(
+        self,
+        batch_size: int,
+        horizon: int,
+        device: torch.device,
+    ) -> Optional[torch.Tensor]:
+        """Psi0-style training RTC: random prefix delay, supervise postfix only."""
+        if not self.rtc_enabled:
+            return None
+        delay = torch.randint(
+            0,
+            self.rtc_max_delay,
+            (int(batch_size),),
+            device=device,
+        )
+        prefix = torch.arange(int(horizon), device=device).unsqueeze(0) < delay.unsqueeze(1)
+        return (~prefix).to(dtype=torch.float32).unsqueeze(-1)
+
     def _compute_action_loss(
         self,
         pred: torch.Tensor,
         target: torch.Tensor,
         action_is_pad: Optional[torch.Tensor],
         action_dim_is_pad: Optional[torch.Tensor],
+        *,
+        rtc_postfix_mask: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         loss = F.mse_loss(pred.float(), target.float(), reduction="none")
         dim_valid = self._dim_valid_mask(action_dim_is_pad, loss.device, loss.dtype)
@@ -584,16 +624,34 @@ class Phi0(torch.nn.Module):
         if action_is_pad is not None:
             token_valid = (~action_is_pad).to(device=loss.device, dtype=loss.dtype).unsqueeze(-1)
             loss = loss * token_valid
+        if rtc_postfix_mask is not None:
+            loss = loss * rtc_postfix_mask.to(device=loss.device, dtype=loss.dtype)
         if dim_valid is not None and action_is_pad is not None:
             token_valid = (~action_is_pad).float().unsqueeze(-1)
             denom = (dim_valid * token_valid).sum().clamp(min=1.0)
+            if rtc_postfix_mask is not None:
+                denom = (dim_valid * token_valid * rtc_postfix_mask.to(dtype=loss.dtype)).sum().clamp(
+                    min=1.0
+                )
             return loss.sum() / denom
         if dim_valid is not None:
             denom = dim_valid.sum().clamp(min=1.0)
+            if rtc_postfix_mask is not None:
+                denom = (dim_valid * rtc_postfix_mask.to(dtype=loss.dtype)).sum().clamp(min=1.0)
             return loss.sum() / denom
         if action_is_pad is not None:
             token_valid = (~action_is_pad).float().unsqueeze(-1)
-            denom = token_valid.sum().clamp(min=1.0)
+            if rtc_postfix_mask is not None:
+                denom = (
+                    token_valid * rtc_postfix_mask.to(device=loss.device, dtype=loss.dtype)
+                ).expand_as(loss).sum().clamp(min=1.0)
+            else:
+                denom = token_valid.expand_as(loss).sum().clamp(min=1.0)
+            return loss.sum() / denom
+        if rtc_postfix_mask is not None:
+            denom = rtc_postfix_mask.to(device=loss.device, dtype=loss.dtype).expand_as(loss).sum().clamp(
+                min=1.0
+            )
             return loss.sum() / denom
         return loss.mean()
 
@@ -602,6 +660,8 @@ class Phi0(torch.nn.Module):
         pred_norm_7d: torch.Tensor,
         target_norm_7d: torch.Tensor,
         action_is_pad: Optional[torch.Tensor],
+        *,
+        rtc_postfix_mask: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """L1/MSE on normalized 7D controls (VLA-Adapter ``L1Loss(pred, gt_norm)``)."""
         pred = pred_norm_7d
@@ -615,8 +675,15 @@ class Phi0(torch.nn.Module):
         if action_is_pad is not None:
             token_valid = (~action_is_pad).to(device=loss.device, dtype=loss.dtype).unsqueeze(-1)
             loss = loss * token_valid
-            denom = token_valid.sum().clamp(min=1.0) * float(pred.shape[-1])
-            return loss.sum() / denom
+            if rtc_postfix_mask is not None:
+                loss = loss * rtc_postfix_mask.to(device=loss.device, dtype=loss.dtype)
+                denom = (token_valid * rtc_postfix_mask.to(dtype=loss.dtype)).sum().clamp(min=1.0)
+            else:
+                denom = token_valid.sum().clamp(min=1.0)
+            return loss.sum() / (denom * float(pred.shape[-1]))
+        if rtc_postfix_mask is not None:
+            denom = rtc_postfix_mask.to(dtype=loss.dtype).sum().clamp(min=1.0) * float(pred.shape[-1])
+            return (loss * rtc_postfix_mask.to(dtype=loss.dtype)).sum() / denom
         return loss.mean()
 
     def _action_proprio_future(
@@ -779,7 +846,13 @@ class Phi0(torch.nn.Module):
 
                 loss_action = self._compute_action_loss(
 
-                    pred_action, future_action, future_pad, future_dim_pad
+                    pred_action, future_action, future_pad, future_dim_pad,
+
+                    rtc_postfix_mask=self._rtc_postfix_mask(
+
+                        future_action.shape[0], future_action.shape[1], future_action.device
+
+                    ),
 
                 )
 
@@ -827,7 +900,13 @@ class Phi0(torch.nn.Module):
 
                 loss_action = self._compute_action_loss(
 
-                    pred_velocity, target_velocity, future_pad, future_dim_pad
+                    pred_velocity, target_velocity, future_pad, future_dim_pad,
+
+                    rtc_postfix_mask=self._rtc_postfix_mask(
+
+                        future_action.shape[0], future_action.shape[1], future_action.device
+
+                    ),
 
                 )
 
@@ -897,13 +976,25 @@ class Phi0(torch.nn.Module):
 
                         future_pad,
 
+                        rtc_postfix_mask=self._rtc_postfix_mask(
+
+                            future_action.shape[0], future_action.shape[1], future_action.device
+
+                        ),
+
                     )
 
                 else:
 
                     loss_action = self._compute_action_loss(
 
-                        pred_action, future_action, future_pad, future_dim_pad
+                        pred_action, future_action, future_pad, future_dim_pad,
+
+                        rtc_postfix_mask=self._rtc_postfix_mask(
+
+                            future_action.shape[0], future_action.shape[1], future_action.device
+
+                        ),
 
                     )
 
@@ -953,7 +1044,13 @@ class Phi0(torch.nn.Module):
 
                 loss_action = self._compute_action_loss(
 
-                    pred_velocity, target_velocity, future_pad, future_dim_pad
+                    pred_velocity, target_velocity, future_pad, future_dim_pad,
+
+                    rtc_postfix_mask=self._rtc_postfix_mask(
+
+                        future_action.shape[0], future_action.shape[1], future_action.device
+
+                    ),
 
                 )
 

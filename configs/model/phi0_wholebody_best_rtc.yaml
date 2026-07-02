@@ -1,0 +1,11 @@
+# 512-d wholebody ACT + training/deploy RTC (Psi0-style postfix supervision).
+defaults:
+  - phi0_wholebody_best
+  - _self_
+
+rtc:
+  enabled: true
+  max_delay: 8
+  inference_delay: 2
+  execution_horizon: 4
+  schedule: exponential
