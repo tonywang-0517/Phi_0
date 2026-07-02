@@ -16,7 +16,7 @@ OUT_NPZ="${2:-${PHI0_ROOT}/logs/episode_${EPISODE_IDX}_closed_loop/outputs.npz}"
 CHECKPOINT="${CHECKPOINT:-${PHI0_ROOT}/experiments/pick_tissue_valid_wholebody_rtc_8k_ddp4/pick_tissue_valid_wholebody_rtc_act_latest.pt}"
 CONFIG_NAME="${CONFIG_NAME:-train_pick_tissue_finetune_rtc_ddp4}"
 MOTION_SECONDS="${MOTION_SECONDS:-0}"
-INFERENCE_RATE="${INFERENCE_RATE:-2.5}"
+INFERENCE_RATE="${INFERENCE_RATE:-0}"
 
 mkdir -p "$(dirname "${OUT_NPZ}")"
 

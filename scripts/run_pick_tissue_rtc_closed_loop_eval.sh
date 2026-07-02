@@ -15,7 +15,7 @@ EPISODE_IDX="${1:-447}"
 RUN_DIR="${2:-${PHI0_ROOT}/logs/ep${EPISODE_IDX}_rtc_closed_loop_$(date +%Y%m%d_%H%M%S)}"
 CHECKPOINT="${CHECKPOINT:-${PHI0_ROOT}/experiments/pick_tissue_valid_wholebody_rtc_8k_ddp4/pick_tissue_valid_wholebody_rtc_act_latest.pt}"
 CONFIG_NAME="${CONFIG_NAME:-train_pick_tissue_finetune_rtc_ddp4}"
-INFERENCE_RATE="${INFERENCE_RATE:-2.5}"
+INFERENCE_RATE="${INFERENCE_RATE:-0}"
 MOTION_SECONDS="${MOTION_SECONDS:-0}"
 CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0}"
 

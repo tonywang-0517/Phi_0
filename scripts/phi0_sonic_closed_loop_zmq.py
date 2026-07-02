@@ -56,6 +56,13 @@ from phi0.deploy.deploy_keyboard import DeployKeyboardListener, send_start_strea
 from phi0.deploy.robot_proprio import RobotProprioSource  # noqa: E402
 from phi0.deploy.sonic_zmq_io import unified_action_denorm_to_zmq_arrays  # noqa: E402
 from phi0.schema.unified_action_schema import D_UNIFIED  # noqa: E402
+from phi0.inference.closed_loop_sched import (
+    chunk_index_when_result_arrives,
+    inference_pipeline_idle,
+    prefetch_trigger_steps,
+    resolve_min_inference_interval,
+    should_trigger_chunk_prefetch,
+)
 from phi0.inference.session import ActionInferenceSession, resolve_deploy_action_chunk_size
 from phi0.inference.rtc import resolve_rtc_deploy_cfg, shift_action_chunk_rtc, validate_rtc_params
 from phi0.models.vlm.preprocess import normalize_vlm_instruction
@@ -386,10 +393,32 @@ def parse_args():
     p.add_argument("--state-zmq-port", type=int, default=5557)
     p.add_argument("--control-fps", type=float, default=50.0)
     p.add_argument(
+        "--scheduling",
+        type=str,
+        choices=("prefetch", "legacy"),
+        default="prefetch",
+        help=(
+            "prefetch=trigger infer before chunk runs out (step-aligned index); "
+            "legacy=time-based 2.5Hz gate + wall-clock latency index."
+        ),
+    )
+    p.add_argument(
         "--inference-rate",
         type=float,
-        default=2.5,
-        help="Max policy re-inference rate (Hz); async worker runs at most this often.",
+        default=0.0,
+        help="Optional max re-infer rate (Hz). 0=no cap (prefetch mode default).",
+    )
+    p.add_argument(
+        "--infer-latency-budget",
+        type=float,
+        default=0.30,
+        help="Expected infer latency (s) for prefetch trigger margin @ control-fps.",
+    )
+    p.add_argument(
+        "--infer-prefetch-safety-steps",
+        type=int,
+        default=2,
+        help="Extra control steps added to prefetch trigger threshold.",
     )
     p.add_argument("--motion-seconds", type=float, default=0.0, help="0 = run until Ctrl-C")
     p.add_argument("--hand-ramp-frames", type=int, default=40)
@@ -897,6 +926,7 @@ def _inference_worker(
             inference_queue.get(timeout=0.1)
         except queue.Empty:
             continue
+        trigger_steps = int(steps_since_query()) if steps_since_query is not None else 0
         busy_event.set()
         try:
             if defer_inference_without_robot and proprio_source in {"robot", "hybrid"}:
@@ -951,17 +981,43 @@ def _inference_worker(
                 result.obs.control_idx,
             )
             try:
-                result_queue.put_nowait((chunk, t0))
+                result_queue.put_nowait((chunk, t0, trigger_steps))
             except queue.Full:
                 try:
                     result_queue.get_nowait()
                 except queue.Empty:
                     pass
-                result_queue.put_nowait((chunk, t0))
+                result_queue.put_nowait((chunk, t0, trigger_steps))
         except Exception:
             logger.exception("inference worker failed")
         finally:
             busy_event.clear()
+
+
+def _pipeline_idle(
+    *,
+    busy_event: threading.Event,
+    inference_queue: queue.Queue,
+    result_queue: queue.Queue,
+) -> bool:
+    return inference_pipeline_idle(
+        worker_busy=busy_event.is_set(),
+        inference_queue_pending=not inference_queue.empty(),
+        result_queue_pending=not result_queue.empty(),
+    )
+
+
+def _try_enqueue_inference(
+    *,
+    inference_queue: queue.Queue,
+    last_trigger_time: dict[str, float],
+) -> bool:
+    try:
+        last_trigger_time["t"] = time.monotonic()
+        inference_queue.put_nowait(None)
+        return True
+    except queue.Full:
+        return False
 
 
 def _sleep_remaining(t_start: float, period: float) -> None:
@@ -1069,6 +1125,7 @@ def run_closed_loop(args) -> None:
         defer_inference_logged = [False]
         rtc_state = RtcInferState()
         steps_since_query = {"n": 0}
+        last_trigger_time: dict[str, float] = {"t": 0.0}
 
         def _steps_since_query() -> int:
             return int(steps_since_query["n"])
@@ -1106,7 +1163,15 @@ def run_closed_loop(args) -> None:
 
         control_fps = float(args.control_fps)
         loop_period = 1.0 / control_fps
-        inference_interval = 1.0 / max(float(args.inference_rate), 0.1)
+        scheduling = str(getattr(args, "scheduling", "prefetch")).strip().lower()
+        min_infer_interval = resolve_min_inference_interval(float(args.inference_rate))
+        if scheduling == "legacy" and min_infer_interval is None:
+            min_infer_interval = 0.4
+        prefetch_margin = prefetch_trigger_steps(
+            float(getattr(args, "infer_latency_budget", 0.35)),
+            control_fps,
+            safety_steps=int(getattr(args, "infer_prefetch_safety_steps", 2)),
+        )
         action_horizon = int(chunk_h)
 
         cached_chunk: ActionChunk | None = None
@@ -1131,15 +1196,41 @@ def run_closed_loop(args) -> None:
             else f"SONIC live tcp://{args.camera_host}:{args.camera_port}"
         )
         logger.info(
-            "closed loop: camera=%s control=%.1fHz infer<=%.2fHz chunk_h=%d proprio=%s rtc=%s zmq=%s",
+            "closed loop: camera=%s control=%.1fHz sched=%s prefetch=%d infer_cap=%s chunk_h=%d proprio=%s rtc=%s zmq=%s",
             cam_mode,
             control_fps,
-            float(args.inference_rate),
+            scheduling,
+            prefetch_margin,
+            f"{float(args.inference_rate):.2f}Hz" if min_infer_interval is not None else "ASAP",
             chunk_h,
             proprio_source,
             "on" if rtc_cfg.get("enabled") else "off",
             "on" if zmq_enabled else "off (npz only)",
         )
+
+        def _should_trigger() -> bool:
+            pipeline_idle = _pipeline_idle(
+                busy_event=busy_event,
+                inference_queue=inference_queue,
+                result_queue=result_queue,
+            )
+            if scheduling == "legacy":
+                return should_trigger_new_inference(
+                    cached_chunk_exists=(cached_chunk is not None),
+                    inference_thread_running=busy_event.is_set(),
+                    time_since_last_inference=time.monotonic() - last_inference_time,
+                    inference_interval=float(min_infer_interval or 0.4),
+                )
+            return should_trigger_chunk_prefetch(
+                cached_chunk_exists=(cached_chunk is not None),
+                pipeline_idle=pipeline_idle,
+                action_chunk_index=action_chunk_index,
+                action_horizon=action_horizon,
+                prefetch_steps=prefetch_margin,
+                min_interval_s=min_infer_interval,
+                time_since_last_trigger_s=time.monotonic() - last_trigger_time["t"],
+                steps_since_chunk_consumed=int(steps_since_query["n"]),
+            )
 
         try:
             while deadline is None or time.monotonic() < deadline:
@@ -1151,17 +1242,43 @@ def run_closed_loop(args) -> None:
                     robot_proprio.poll()
 
                 try:
-                    chunk, infer_t0 = result_queue.get_nowait()
+                    chunk, infer_t0, trigger_steps = result_queue.get_nowait()
                     delay = time.monotonic() - infer_t0
-                    action_chunk_index = calculate_latency_compensated_index(
+                    steps_now = int(steps_since_query["n"])
+                    if scheduling == "legacy":
+                        action_chunk_index = calculate_latency_compensated_index(
+                            delay, control_fps, action_horizon
+                        )
+                        idx_mode = "wall"
+                    else:
+                        action_chunk_index = chunk_index_when_result_arrives(
+                            steps_now,
+                            trigger_steps,
+                            action_horizon,
+                        )
+                        idx_mode = "steps"
+                    wall_idx = calculate_latency_compensated_index(
                         delay, control_fps, action_horizon
                     )
+                    chunk_cover_s = max(action_horizon - 1, 1) / control_fps
+                    if delay > chunk_cover_s * 0.95:
+                        logger.warning(
+                            "infer latency %.3fs > chunk cover %.3fs — idx=%d; "
+                            "speed up GPU infer or increase chunk_h",
+                            delay,
+                            chunk_cover_s,
+                            action_chunk_index,
+                        )
                     cached_chunk = chunk
                     last_inference_time = time.monotonic()
                     steps_since_query["n"] = 0
                     logger.info(
-                        "new chunk idx=%d latency=%.3fs token0=%+.3f",
+                        "new chunk idx=%d (%s=%d wall=%d trigger@%d latency=%.3fs) token0=%+.3f",
                         action_chunk_index,
+                        idx_mode,
+                        action_chunk_index,
+                        wall_idx,
+                        trigger_steps,
                         delay,
                         float(chunk.tokens[action_chunk_index, 0]),
                     )
@@ -1174,29 +1291,19 @@ def run_closed_loop(args) -> None:
                     pass
 
                 if cached_chunk is None:
-                    if should_trigger_new_inference(
-                        cached_chunk_exists=False,
-                        inference_thread_running=busy_event.is_set(),
-                        time_since_last_inference=time.monotonic() - last_inference_time,
-                        inference_interval=inference_interval,
-                    ):
-                        try:
-                            inference_queue.put_nowait(None)
-                        except queue.Full:
-                            pass
+                    if _should_trigger():
+                        _try_enqueue_inference(
+                            inference_queue=inference_queue,
+                            last_trigger_time=last_trigger_time,
+                        )
                     _sleep_remaining(t_start, loop_period)
                     continue
 
-                if should_trigger_new_inference(
-                    cached_chunk_exists=True,
-                    inference_thread_running=busy_event.is_set(),
-                    time_since_last_inference=time.monotonic() - last_inference_time,
-                    inference_interval=inference_interval,
-                ):
-                    try:
-                        inference_queue.put_nowait(None)
-                    except queue.Full:
-                        pass
+                if _should_trigger():
+                    _try_enqueue_inference(
+                        inference_queue=inference_queue,
+                        last_trigger_time=last_trigger_time,
+                    )
 
                 idx = min(action_chunk_index, cached_chunk.horizon - 1)
                 ramp = hand_ramp_weights(total_frames_sent + 1, int(args.hand_ramp_frames))[-1]

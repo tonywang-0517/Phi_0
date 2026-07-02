@@ -35,7 +35,7 @@ class EpisodeRolloutConfig:
     device: str = "cuda"
     min_free_gb: float = 12.0
     control_fps: float = 50.0
-    inference_rate: float = 2.5
+    inference_rate: float = 0.0
     hand_ramp_frames: int = 40
     start_control_idx: int = 0
     motion_seconds: float = 0.0
@@ -75,6 +75,9 @@ def main(config: EpisodeRolloutConfig) -> None:
         state_zmq_port=5557,
         control_fps=float(config.control_fps),
         inference_rate=float(config.inference_rate),
+        scheduling="prefetch",
+        infer_latency_budget=0.30,
+        infer_prefetch_safety_steps=2,
         motion_seconds=float(config.motion_seconds),
         hand_ramp_frames=int(config.hand_ramp_frames),
         start_delay_s=0.0,
