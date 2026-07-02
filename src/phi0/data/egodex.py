@@ -14,6 +14,7 @@ from phi0.data.cosmos_video_size import DEFAULT_COSMOS_VIDEO_SIZE
 from phi0.data.egodex_keypoints import pack_egodex_keypoints_d_raw
 from phi0.data.egodex_smplh import default_processed_path, resolve_processed_hdf5
 from phi0.data.video_cache import preload_mp4_frames
+from phi0.paths import workspace_root
 from phi0.schema.draw_schema import D_RAW, DrawLayout
 
 _LEGACY_D_RAW = 237
@@ -29,7 +30,7 @@ def _pad_to_current_d_raw(arr: np.ndarray) -> np.ndarray:
         return out
     raise ValueError(f"Expected d_raw/dim last dim {_LEGACY_D_RAW} or {D_RAW}, got {arr.shape[-1]}")
 
-DEFAULT_ROOT = Path("/mnt/data1/wpy/workspace/Isaac-GR00T/demo_data/egodex")
+DEFAULT_ROOT = workspace_root() / "Isaac-GR00T/demo_data/egodex"
 DEFAULT_HDF5 = DEFAULT_ROOT / "test/add_remove_lid/0.hdf5"
 DEFAULT_MP4 = DEFAULT_ROOT / "test/add_remove_lid/0.mp4"
 

@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Mapping, Protocol
 
 import h5py
@@ -126,6 +126,56 @@ def build_lazy_deploy_gt_norm_lut(
         history_w=history_w,
     )
     return LazyDeployGtNormLut(backend, processor, indices)
+
+
+def history_window_for_model(model) -> int:
+    if getattr(model, "uses_history_action_input", lambda: False)():
+        return int(getattr(model, "action_history_window", 0) or 0)
+    return int(getattr(model, "past_action_window_size", 1) or 1)
+
+
+@dataclass
+class GtEpisodeProprioSource:
+    """Dataset unified proprio indexed by deploy control step (same episode as GT video)."""
+
+    backend: DeployGtBackend
+    _cache: dict[int, torch.Tensor] = field(default_factory=dict)
+
+    def _norm_at(self, processor: Phi0Processor, control_idx: int) -> torch.Tensor:
+        c = int(control_idx)
+        if c not in self._cache:
+            d_raw, _ = self.backend.pack_deploy_frame(
+                control_idx=c,
+                state_control_idx=c,
+            )
+            self._cache[c] = _normalize_d_raw(processor, d_raw).reshape(-1)
+        return self._cache[c]
+
+    def history_normalized(
+        self,
+        processor: Phi0Processor,
+        control_idx: int,
+        *,
+        model,
+    ) -> torch.Tensor:
+        from phi0.inference.deploy_align import deploy_history_control_indices
+
+        w = history_window_for_model(model)
+        if w <= 0:
+            raise RuntimeError("model proprio/history window must be positive")
+        hist_idxs = deploy_history_control_indices(int(control_idx), w)
+        return torch.stack(
+            [self._norm_at(processor, c) for c in hist_idxs],
+            dim=0,
+        )
+
+    def apply_to_session(self, session, processor: Phi0Processor, control_idx: int) -> None:
+        hist = self.history_normalized(
+            processor,
+            control_idx,
+            model=session.model,
+        )
+        session.set_proprio_gt(hist.unsqueeze(0))
 
 
 @dataclass(frozen=True)

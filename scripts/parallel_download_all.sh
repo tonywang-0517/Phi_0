@@ -14,7 +14,7 @@ if [[ -f "${ROOT}/.env" ]]; then
 fi
 
 export HF_ENDPOINT="${HF_ENDPOINT:-https://huggingface.co}"
-export PHI0_WORKSPACE="${PHI0_WORKSPACE:-/mnt/data2/wpy/workspace}"
+export PHI0_WORKSPACE="${PHI0_WORKSPACE:-/home/user}"
 
 echo "[$(date '+%H:%M:%S')] START minimal_samples" | tee "${LOG_DIR}/minimal_samples.log"
 python "${ROOT}/scripts/download_samples.py" >>"${LOG_DIR}/minimal_samples.log" 2>&1

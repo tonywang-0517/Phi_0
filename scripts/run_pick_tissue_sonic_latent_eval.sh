@@ -3,8 +3,9 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-PHI0_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
-GR00T_ROOT="$(cd "${PHI0_ROOT}/../GR00T-WholeBodyControl" && pwd)"
+# shellcheck source=/dev/null
+source "${SCRIPT_DIR}/setup_env.sh"
+GR00T_ROOT="$(cd "${GR00T_ROOT}" && pwd)"
 VENV_SIM="${GR00T_ROOT}/.venv_sim"
 DEPLOY="${GR00T_ROOT}/gear_sonic_deploy"
 ROBOT_MOTION="${ROBOT_MOTION:-${GR00T_ROOT}/sample_data/robot_filtered/210531/walk_forward_amateur_001__A001.pkl}"
@@ -14,12 +15,12 @@ WORK_DIR="$(cd "${WORK_DIR}" && pwd)"
 LOG_DIR="${WORK_DIR}/logs"
 mkdir -p "${LOG_DIR}"
 
-PHI0_PY="${PHI0_PY:-/mnt/data/miniconda3/envs/Phi-0-wpy/bin/python}"
+PHI0_PY="${PHI0_PY:-/home/user/anaconda3/envs/Phi-0-wpy/bin/python}"
 VALID_ROOT="${VALID_ROOT:-${PHI0_ROOT}/../Isaac-GR00T/data/pick_tissue_valid}"
 UNIFIED_ROOT="${UNIFIED_ROOT:-${PHI0_ROOT}/../Isaac-GR00T/data/pick_tissue_xperience_unified}"
 MANIFEST_PATH="${MANIFEST_PATH:-${PHI0_ROOT}/../Isaac-GR00T/data/pick_tissues.json}"
 TOKEN_SOURCE="${TOKEN_SOURCE:-unified_slice}"
-CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-4}"
+CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0}"
 RECORD_FPS="${RECORD_FPS:-30}"
 CONTROL_FPS="${CONTROL_FPS:-50}"
 MOTION_SECONDS="${MOTION_SECONDS:-8}"
@@ -35,10 +36,8 @@ export MUJOCO_GL="${MUJOCO_GL:-egl}"
 export CUDA_VISIBLE_DEVICES
 export PYTHONUNBUFFERED=1
 export PYTHONPATH="${GR00T_ROOT}:${PHI0_ROOT}/src:${PYTHONPATH:-}"
-export TensorRT_ROOT="${TensorRT_ROOT:-/mnt/data2/TensorRT-10.13.3.9}"
-export onnxruntime_ROOT="${onnxruntime_ROOT:-/mnt/data2/wpy/deps/onnxruntime-linux-x64-1.16.3}"
+# TensorRT / onnxruntime / unitree DDS: setup_env.sh
 export CUDA_HOME="${CUDA_HOME:-/usr/local/cuda-12.8}"
-export LD_LIBRARY_PATH="${TensorRT_ROOT}/lib:${onnxruntime_ROOT}/lib:${LD_LIBRARY_PATH:-}"
 SIM_WARMUP_S="${SIM_WARMUP_S:-10}"
 DEPLOY_INIT_TIMEOUT_S="${DEPLOY_INIT_TIMEOUT_S:-300}"
 REPLAY_READY_TIMEOUT_S="${REPLAY_READY_TIMEOUT_S:-900}"
@@ -89,7 +88,26 @@ EGO_MP4="${EGO_MP4:-${UNIFIED_ROOT}/videos/chunk-000/observation.images.ego_view
 WRIST_MP4="${WRIST_MP4:-${UNIFIED_ROOT}/videos/chunk-000/observation.images.left_wrist/episode_$(printf '%06d' "${UNIFIED_EP}").mp4}"
 OUT_MP4="${OUT_MP4:-${WORK_DIR}/pick_tissue_ep${UNIFIED_EP}_sonic_latent_$([ -n "${CHECKPOINT}" ] && echo model || echo gt).mp4}"
 
-if [[ "${MAX_FRAMES}" -le 0 ]]; then
+if [[ -n "${MOTION_NPZ:-}" && -f "${MOTION_NPZ}" ]]; then
+  _NPZ_FRAMES="$("${PHI0_PY}" - <<PY
+import numpy as np
+print(int(np.load("${MOTION_NPZ}")["tokens"].shape[0]))
+PY
+  )"
+  if [[ "${MAX_FRAMES}" -le 0 ]]; then
+    MAX_FRAMES="${_NPZ_FRAMES}"
+  else
+    MAX_FRAMES="$("${PHI0_PY}" - <<PY
+print(min(int("${MAX_FRAMES}"), int("${_NPZ_FRAMES}")))
+PY
+)"
+  fi
+  MOTION_SECONDS="$("${PHI0_PY}" - <<PY
+print(round(int("${MAX_FRAMES}") / float("${CONTROL_FPS}"), 2))
+PY
+  )"
+  echo "[sonic_latent] MOTION_NPZ=${MOTION_NPZ} frames=${MAX_FRAMES} (~${MOTION_SECONDS}s)"
+elif [[ "${MAX_FRAMES}" -le 0 ]]; then
   MAX_FRAMES="$("${PHI0_PY}" - <<PY
 import math
 print(int(math.ceil(float("${MOTION_SECONDS}") * float("${CONTROL_FPS}"))))
@@ -102,7 +120,7 @@ print(pq.read_metadata("${UNIFIED_PARQUET}").num_rows)
 PY
 )"
 REQUESTED="${MAX_FRAMES}"
-if [[ "${PARQUET_ROWS}" -lt "${MAX_FRAMES}" ]]; then
+if [[ -z "${MOTION_NPZ:-}" && "${PARQUET_ROWS}" -lt "${MAX_FRAMES}" ]]; then
   MAX_FRAMES="${PARQUET_ROWS}"
   EP_DUR="$("${PHI0_PY}" - <<PY
 print(round(${PARQUET_ROWS}/float("${CONTROL_FPS}"), 2))
@@ -115,7 +133,7 @@ RECORD_START="${WORK_DIR}/.record_start"
 RECORD_STOP="${WORK_DIR}/.record_stop"
 ARM_FLAG="${WORK_DIR}/.arm_deploy"
 REPLAY_READY="${WORK_DIR}/.replay_go"
-DEPLOY_FIFO="/mnt/data2/tmp/pick_tissue_sonic_deploy_$$.fifo"
+DEPLOY_FIFO="${DEPLOY_FIFO:-/tmp/pick_tissue_sonic_deploy_$$.fifo}"
 
 SIM_PID=""
 DEPLOY_PID=""
@@ -144,7 +162,13 @@ require_pid() {
 }
 
 require_replay() {
-  require_pid "${REPLAY_PID}" "model publisher" "${LOG_DIR}/replay.log"
+  local label="replay"
+  if [[ -n "${MOTION_NPZ:-}" ]]; then
+    label="npz replay"
+  elif [[ -n "${CHECKPOINT:-}" ]]; then
+    label="model publisher"
+  fi
+  require_pid "${REPLAY_PID}" "${label}" "${LOG_DIR}/replay.log"
   if grep -qE "Traceback \(most recent call last\)" "${LOG_DIR}/replay.log" 2>/dev/null; then
     log_step "model publisher crashed"
     tail -30 "${LOG_DIR}/replay.log"
@@ -194,12 +218,15 @@ echo "[sonic_latent] unified=${UNIFIED_PARQUET} valid_hands=${VALID_PARQUET}"
 echo "[sonic_latent] token_source=${TOKEN_SOURCE} frames=${MAX_FRAMES} out=${OUT_MP4}"
 if [[ -n "${CHECKPOINT}" ]]; then
   echo "[sonic_latent] MODEL checkpoint=${CHECKPOINT} config=${CONFIG_NAME}"
+elif [[ -n "${MOTION_NPZ:-}" ]]; then
+  echo "[sonic_latent] NPZ replay motion=${MOTION_NPZ} hand_ramp=${HAND_RAMP_FRAMES:-0}"
 fi
 log_step "work_dir=${WORK_DIR} gpu=${CUDA_VISIBLE_DEVICES} sim_warmup=${SIM_WARMUP_S}s deploy_timeout=${DEPLOY_INIT_TIMEOUT_S}s"
 
 pkill -f "run_sim_loop_vla_record" 2>/dev/null || true
 pkill -f "g1_deploy_onnx_ref.*zmq_manager" 2>/dev/null || true
 pkill -f "replay_pick_tissue_sonic_latent_zmq_v4" 2>/dev/null || true
+pkill -f "replay_sonic_latent_npz_zmq_v4" 2>/dev/null || true
 for port in 5555 5556 5557; do
   fuser -k "${port}/tcp" >/dev/null 2>&1 || true
 done
@@ -246,18 +273,24 @@ fi
 
 # 1) MuJoCo sim + mp4 (defaults match sonic_latent_gt_20260628_030836)
 SIM_EXTRA_ARGS=()
+SIM_EGO_GT="${EGO_MP4}"
 if [[ "${GT_PANEL_LAYOUT}" == "top" ]]; then
   SIM_EXTRA_ARGS+=(--gt-panel-layout top --wrist-gt-video "${WRIST_MP4}")
+elif [[ "${GT_PANEL_LAYOUT}" == "sim" ]]; then
+  SIM_EGO_GT=""
+  SIM_EXTRA_ARGS+=(--camera-host 127.0.0.1)
 fi
 if [[ "${ENABLE_G1_DEBUG_OVERLAY}" == "1" ]]; then
   SIM_EXTRA_ARGS+=(--enable-g1-debug-overlay)
 else
   SIM_EXTRA_ARGS+=(--g1-debug-snap --no-enable-g1-debug-overlay)
 fi
+# Cluster-rsync'd .venv_sim needs local python + VIRTUAL_ENV paths.
+bash "${PHI0_ROOT}/scripts/fix_venv_sim.sh" >> "${LOG_DIR}/fix_venv_sim.log" 2>&1 || true
 (
   cd "${GR00T_ROOT}"
   source "${VENV_SIM}/bin/activate"
-  python experiments/sonic_vla_overfit/scripts/run_sim_loop_vla_record.py \
+  python -u experiments/sonic_vla_overfit/scripts/run_sim_loop_vla_record.py \
     --no-enable-onscreen \
     --enable-image-publish --enable-offscreen \
     --disable-elastic-band \
@@ -265,7 +298,7 @@ fi
     --g1-debug-host 127.0.0.1 \
     --g1-debug-port 5557 \
     --no-snap-on-record-start \
-    --ego-gt-video "${EGO_MP4}" \
+    ${SIM_EGO_GT:+--ego-gt-video "${SIM_EGO_GT}"} \
     --record-mp4 "${OUT_MP4}" \
     --record-start-flag "${RECORD_START}" \
     --record-stop-flag "${RECORD_STOP}" \
@@ -275,8 +308,12 @@ fi
 SIM_PID=$!
 log_step "sim pid=${SIM_PID} log=${LOG_DIR}/sim.log"
 wait_log "${LOG_DIR}/sim.log" "Sensor server running" 120 "sim Sensor server" || {
-  require_pid "${SIM_PID}" "sim" "${LOG_DIR}/sim.log"
-  tail -30 "${LOG_DIR}/sim.log"; exit 1;
+  if ss -tlnp 2>/dev/null | grep -qE ":${CAMERA_PORT:-5555}\\b"; then
+    log_step "wait_log: OK sim Sensor server (port ${CAMERA_PORT:-5555} listening)"
+  else
+    require_pid "${SIM_PID}" "sim" "${LOG_DIR}/sim.log"
+    tail -30 "${LOG_DIR}/sim.log"; exit 1;
+  fi
 }
 log_step "sim up; LowState bridge warmup ${SIM_WARMUP_S}s..."
 for ((w=SIM_WARMUP_S; w>0; w-=5)); do
@@ -286,7 +323,20 @@ for ((w=SIM_WARMUP_S; w>0; w-=5)); do
 done
 
 # 2) ZMQ v4 publisher: arm_flag -> command start; replay_go -> pose stream
-if [[ -n "${CHECKPOINT}" ]]; then
+if [[ -n "${MOTION_NPZ:-}" ]]; then
+  log_step "starting motion npz replay (${MOTION_NPZ})..."
+  (
+    "${PHI0_PY}" "${PHI0_ROOT}/scripts/replay_sonic_latent_npz_zmq_v4.py" \
+      --npz "${MOTION_NPZ}" \
+      --zmq-port 5556 \
+      --fps "${CONTROL_FPS}" \
+      --max-frames "${MAX_FRAMES}" \
+      --start-delay-s 0.5 \
+      --hand-ramp-frames "${HAND_RAMP_FRAMES:-0}" \
+      --arm-flag "${ARM_FLAG}" \
+      --ready-flag "${REPLAY_READY}"
+  ) > "${LOG_DIR}/replay.log" 2>&1 &
+elif [[ -n "${CHECKPOINT}" ]]; then
   log_step "starting Phi-0 model publisher..."
   PUBLISHER_ARGS=(
     --config-name "${CONFIG_NAME}"
@@ -327,7 +377,9 @@ else
 fi
 REPLAY_PID=$!
 log_step "replay pid=${REPLAY_PID} log=${LOG_DIR}/replay.log"
-if [[ -n "${CHECKPOINT}" ]]; then
+if [[ -n "${MOTION_NPZ:-}" ]]; then
+  wait_log "${LOG_DIR}/replay.log" "bound tcp://" 30 "npz replay bound" || require_pid "${REPLAY_PID}" "npz replay" "${LOG_DIR}/replay.log"
+elif [[ -n "${CHECKPOINT}" ]]; then
   # Precomputed path binds tcp in ~1s; inline VLM+inference may take minutes.
   wait_timeout=600
   if [[ "${USE_PRECOMPUTE_NPZ}" == "1" ]]; then
@@ -433,13 +485,26 @@ touch "${REPLAY_READY}"
 log_step "recording + streaming ${MAX_FRAMES} frames @ ${CONTROL_FPS}Hz..."
 require_replay
 
+while kill -0 "${REPLAY_PID}" 2>/dev/null; do
+  require_pid "${SIM_PID}" "sim" "${LOG_DIR}/sim.log"
+  require_pid "${DEPLOY_PID}" "deploy" "${LOG_DIR}/deploy.log"
+  sleep 2
+done
 wait "${REPLAY_PID}" || true
 sleep 1
 touch "${RECORD_STOP}"
 for _ in $(seq 1 60); do
   grep -q "sim_record] saved" "${LOG_DIR}/sim.log" 2>/dev/null && break
+  if ! kill -0 "${SIM_PID}" 2>/dev/null; then
+    log_step "WARN: sim exited before record save; see ${LOG_DIR}/sim.log"
+    break
+  fi
   sleep 0.5
 done
+if [[ -n "${MOTION_NPZ:-}" ]]; then
+  token_rx="$(grep -c "Received 64D token" "${LOG_DIR}/deploy.log" 2>/dev/null || echo 0)"
+  log_step "deploy received ${token_rx} x 64D token frames"
+fi
 
 # ponytail: OpenCV mp4v is unreadable on many players; remux to H.264
 OUT_H264="${OUT_MP4%.mp4}_h264.mp4"

@@ -2,7 +2,7 @@
 # @package data
 
 dataset: pick_tissue_unified
-pick_tissue_root: /mnt/data2/wpy/workspace/Isaac-GR00T/data
+pick_tissue_root: ${oc.env:PHI0_WORKSPACE,/home/user}/Isaac-GR00T/data
 pick_tissue_repo_id: pick_tissue_xperience_unified
 action_dim: 512
 seq_len: 33
@@ -19,6 +19,6 @@ normalize: true
 mono_camera: false
 use_left_wrist: true
 action_norm_mode: z-score
-action_stats_path: /mnt/data2/wpy/workspace/Isaac-GR00T/data/pick_tissue_xperience_unified/meta/stats_pick_tissue_unified.json
+action_stats_path: ${oc.env:PHI0_WORKSPACE,/home/user}/Isaac-GR00T/data/pick_tissue_xperience_unified/meta/stats_pick_tissue_unified.json
 auto_compute_action_stats: true
 val_ratio: 0.05

@@ -11,6 +11,6 @@ action_dit_config:
 
 vggt:
   enabled: true
-  checkpoint_path: /mnt/data2/wpy/workspace/vggt-omega/checkpoints/vggt_omega_1b_512.pt
+  checkpoint_path: ${oc.env:PHI0_WORKSPACE,/home/user}/vggt-omega/checkpoints/vggt_omega_1b_512.pt
   image_resolution: 512
   freeze: true
