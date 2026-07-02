@@ -84,7 +84,7 @@ GT_VIEW_ARGS=(--show-gt-views)
 if [[ "${SHOW_GT_VIEWS}" == "0" ]]; then
   GT_VIEW_ARGS=(--no-show-gt-views)
 fi
-"${HGPT_PY}" -m experiments.phi0_hgpt_zmq.hgpt_zmq_tracker_sim \
+"${HGPT_PY}" "${HGPT_ROOT}/experiments/phi0_hgpt_zmq/hgpt_zmq_tracker_sim.py" \
   --connect "tcp://127.0.0.1:${ZMQ_PORT}" \
   --stand-seconds "${STAND_SECONDS}" \
   --recv-timeout-ms "${RECV_TIMEOUT_MS}" \
@@ -105,7 +105,7 @@ fi
 
 echo "[2/2] Phi-0 publisher burst use_gt=${USE_GT} deploy_mode=${DEPLOY_MODE} motion_s=${MOTION_SECONDS} fps=${CONTROL_FPS}..."
 cd "${PHI0_ROOT}"
-"${PHI0_PY}" -m experiments.phi0_hgpt_zmq.phi0_zmq_publisher \
+"${PHI0_PY}" "${PHI0_ROOT}/scripts/phi0_zmq_publisher.py" \
   --checkpoint "${CHECKPOINT}" \
   --config-name "${CONFIG_NAME}" \
   --clip-idx "${CLIP_IDX}" \

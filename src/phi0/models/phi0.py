@@ -1111,6 +1111,60 @@ class Phi0(torch.nn.Module):
         )
 
     @torch.no_grad()
+    def predict_action_fm_rtc_prefix(
+        self,
+        action_context: torch.Tensor,
+        action_context_mask: torch.Tensor,
+        num_frames: int,
+        prev_actions: torch.Tensor,
+        *,
+        inference_delay: int,
+        batch_size: int = 1,
+        context_emb: Optional[torch.Tensor] = None,
+        vggt_context: Optional[torch.Tensor] = None,
+        vggt_context_mask: Optional[torch.Tensor] = None,
+        vggt_context_emb: Optional[torch.Tensor] = None,
+        proprio_tokens: Optional[torch.Tensor] = None,
+        history: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """FM denoise with frozen prefix (Psi0 training-time RTC)."""
+        if self.action_head != "fm" or self.action_fm is None:
+            raise RuntimeError("predict_action_fm_rtc_prefix requires action_head='fm'.")
+        if context_emb is None:
+            context_emb = self.action_expert.text_embedding(action_context)
+
+        def _predict_velocity(noisy: torch.Tensor, t_disc: torch.Tensor) -> torch.Tensor:
+            return self._predict_velocity(
+                noisy,
+                t_disc,
+                action_context,
+                action_context_mask,
+                context_emb=context_emb,
+                vggt_context=vggt_context,
+                vggt_context_mask=vggt_context_mask,
+                vggt_context_emb=vggt_context_emb,
+                proprio_tokens=proprio_tokens,
+            )
+
+        initial_state: Optional[torch.Tensor] = None
+        if self.uses_history_action_input():
+            if history is None:
+                raise ValueError("history is required for FM RTC when uses_history_action_input=True")
+            initial_state = history_to_flow_source(history, int(num_frames))
+
+        return self.action_fm.denoise_euler_rtc_prefix(
+            _predict_velocity,
+            prev_actions=prev_actions,
+            inference_delay=int(inference_delay),
+            initial_state=initial_state,
+            batch_size=int(batch_size),
+            seq_len=int(num_frames),
+            action_dim=self.action_expert.raw_action_dim,
+            device=self.device,
+            dtype=self.torch_dtype,
+        )
+
+    @torch.no_grad()
     def predict_action_act(
         self,
         action_context: torch.Tensor,

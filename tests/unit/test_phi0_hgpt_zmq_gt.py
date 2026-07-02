@@ -264,7 +264,7 @@ def test_encode_meta_pick_tissue_fields():
 
 
 def test_gt_views_track_mapping_and_composite():
-    from experiments.phi0_hgpt_zmq.gt_views import (
+    from phi0.deploy.gt_views import (
         build_track_panel_indices,
         composite_tracker_gt_views,
         track_step_to_pub_idx,

@@ -36,10 +36,12 @@ from phi0.deploy.gt_io import (  # noqa: E402
 )
 from phi0.deploy.pick_tissue_gt import clip_dataset_index_for_episode  # noqa: E402
 from phi0.inference.session import (  # noqa: E402
+    ActionInferenceSession,
     ClipInputsCache,
     PromptEmbedCache,
     resolve_deploy_action_chunk_size,
 )
+from phi0.inference.rtc import create_rtc_soft_mask, validate_rtc_params  # noqa: E402
 from phi0.runtime import (  # noqa: E402
     activate_cuda_device,
     apply_processor_stats_from_checkpoint,
@@ -50,8 +52,7 @@ from phi0.runtime import (  # noqa: E402
     sync_model_action_norm,
 )
 
-# ponytail: reuse multi-chunk deploy inference from HGPT publisher
-from experiments.phi0_hgpt_zmq.phi0_zmq_publisher import (  # noqa: E402
+from phi0.deploy.deploy_inference import (  # noqa: E402
     _history_window,
     _predict_motion_deploy,
     _resolve_eval_dataset,
@@ -91,6 +92,11 @@ def parse_args():
         default="",
         help="Skip model; stream motion from a prior --precompute-out npz.",
     )
+    # RTC flags — override model cfg rtc.* defaults
+    p.add_argument("--rtc", action="store_true", default=False, help="Enable Psi0-style RTC blending")
+    p.add_argument("--rtc-inference-delay", type=int, default=0, help="d: frozen steps (0 = use model cfg)")
+    p.add_argument("--rtc-execution-horizon", type=int, default=0, help="s: re-query cadence (0 = use model cfg)")
+    p.add_argument("--rtc-schedule", type=str, default="", help="exponential|linear|hard|simple ('' = model cfg)")
     return p.parse_args()
 
 
@@ -153,6 +159,87 @@ def _load_precompute(path: Path) -> tuple[np.ndarray, np.ndarray, np.ndarray, in
     return tokens, left, right, episode_idx
 
 
+def _shift_chunk_rtc(chunk: torch.Tensor, s: int) -> torch.Tensor:
+    """Roll chunk forward by s steps; pad tail with last frame (align prev chunk to next query time)."""
+    # chunk: [H, D]
+    if chunk.ndim == 3:
+        c = chunk[0]
+        shifted = torch.cat([c[s:], c[-1:].expand(s, -1)], dim=0)
+        return shifted.unsqueeze(0)
+    shifted = torch.cat([chunk[s:], chunk[-1:].expand(s, -1)], dim=0)
+    return shifted
+
+
+@torch.no_grad()
+def _predict_motion_deploy_rtc(
+    model,
+    processor,
+    inputs: dict,
+    *,
+    num_frames: int,
+    proprio_w: int,
+    gt_norm_lut,
+    inference_delay: int,
+    execution_horizon: int,
+    schedule: str = "exponential",
+) -> np.ndarray:
+    """RTC-blended multi-chunk deploy: re-query every execution_horizon steps."""
+    from phi0.inference.deploy_align import deploy_history_control_indices
+
+    chunk_h = resolve_deploy_action_chunk_size(model)
+    validate_rtc_params(chunk_h, inference_delay, execution_horizon)
+
+    session = ActionInferenceSession(model, processor=processor, use_gt_history=True)
+    session.prefill_from_clip_inputs(inputs)
+    history_w = _history_window(model)
+    device = model.device
+    if hasattr(gt_norm_lut, "pin_device"):
+        gt_norm_lut.pin_device(device)
+    use_amp = device.type == "cuda"
+    amp_dtype = torch.bfloat16
+
+    prev_chunk_norm: torch.Tensor | None = None
+    chunks: list[np.ndarray] = []
+
+    for seg_start in range(0, num_frames, execution_horizon):
+        deploy_c = proprio_w + seg_start
+        if history_w > 0:
+            hist_idxs = deploy_history_control_indices(deploy_c, history_w)
+            hist = torch.stack([gt_norm_lut[c] for c in hist_idxs], dim=0).to(
+                device, non_blocking=True
+            )
+            session.set_history_gt(hist)
+
+        with torch.autocast(device_type=device.type, dtype=amp_dtype, enabled=use_amp):
+            if prev_chunk_norm is None:
+                pred_norm = session.predict(chunk_h, denormalize=False)
+            else:
+                pred_norm = session.predict_rtc(
+                    chunk_h,
+                    prev_chunk_norm,
+                    inference_delay=inference_delay,
+                    execution_horizon=execution_horizon,
+                    schedule=schedule,
+                    denormalize=False,
+                )
+
+        # Shift for next query (align previous chunk to next time origin)
+        prev_chunk_norm = _shift_chunk_rtc(
+            pred_norm.detach().to(dtype=torch.float32), execution_horizon
+        )
+
+        # Take only execution_horizon steps from blended chunk
+        chunk_len = min(execution_horizon, num_frames - seg_start)
+        take = pred_norm[:chunk_len] if pred_norm.ndim == 2 else pred_norm[0, :chunk_len]
+        if processor is not None:
+            denormed = processor.postprocess(take.unsqueeze(0)).squeeze(0)
+        else:
+            denormed = take
+        chunks.append(denormed.float().detach().cpu().numpy())
+
+    return np.concatenate(chunks, axis=0)
+
+
 @torch.no_grad()
 def _run_model_inference(
     *,
@@ -162,6 +249,7 @@ def _run_model_inference(
     episode_idx: int,
     num_frames: int,
     control_fps: float,
+    rtc_cfg: dict | None = None,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     activate_cuda_device(device)
     cfg.device = device
@@ -238,14 +326,33 @@ def _run_model_inference(
         cache_action_context=True,
         collate_fn=collate_fn,
     )
-    action_denorm = _predict_motion_deploy(
-        model,
-        processor,
-        inputs,
-        num_frames=num_frames,
-        proprio_w=proprio_w,
-        gt_norm_lut=gt_norm_lut,
-    )
+    if rtc_cfg and rtc_cfg.get("enabled"):
+        logger.info(
+            "RTC enabled: d=%d s=%d schedule=%s",
+            rtc_cfg["inference_delay"],
+            rtc_cfg["execution_horizon"],
+            rtc_cfg["schedule"],
+        )
+        action_denorm = _predict_motion_deploy_rtc(
+            model,
+            processor,
+            inputs,
+            num_frames=num_frames,
+            proprio_w=proprio_w,
+            gt_norm_lut=gt_norm_lut,
+            inference_delay=int(rtc_cfg["inference_delay"]),
+            execution_horizon=int(rtc_cfg["execution_horizon"]),
+            schedule=str(rtc_cfg["schedule"]),
+        )
+    else:
+        action_denorm = _predict_motion_deploy(
+            model,
+            processor,
+            inputs,
+            num_frames=num_frames,
+            proprio_w=proprio_w,
+            gt_norm_lut=gt_norm_lut,
+        )
     logger.info(
         "inference done: %d frames x %d-d; GT LUT loaded %d/%d",
         num_frames,
@@ -321,6 +428,16 @@ def _stream_over_zmq(
     ctx.term()
 
 
+def _resolve_rtc_cfg(cfg, args) -> dict:
+    """Merge model-cfg rtc.* defaults with CLI overrides. CLI wins when non-default."""
+    model_rtc = getattr(cfg, "rtc", None) or {}
+    enabled = bool(getattr(model_rtc, "enabled", False)) or bool(args.rtc)
+    d = int(args.rtc_inference_delay or getattr(model_rtc, "inference_delay", 2))
+    s = int(args.rtc_execution_horizon or getattr(model_rtc, "execution_horizon", 4))
+    schedule = str(args.rtc_schedule or getattr(model_rtc, "schedule", "exponential"))
+    return {"enabled": enabled, "inference_delay": d, "execution_horizon": s, "schedule": schedule}
+
+
 def main() -> None:
     args = parse_args()
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
@@ -346,6 +463,7 @@ def main() -> None:
         device = resolve_inference_device(args.device, min_free_gb=float(args.min_free_gb))
         with initialize_config_dir(version_base="1.3", config_dir=args.config_dir):
             cfg = compose(config_name=args.config_name)
+        rtc_cfg = _resolve_rtc_cfg(cfg, args)
         tokens, left, right = _run_model_inference(
             cfg=cfg,
             ckpt_path=ckpt_path,
@@ -353,6 +471,7 @@ def main() -> None:
             episode_idx=episode_idx,
             num_frames=num_frames,
             control_fps=timeline_fps,
+            rtc_cfg=rtc_cfg,
         )
         if precompute_out is not None:
             _save_precompute(

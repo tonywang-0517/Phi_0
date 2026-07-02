@@ -316,14 +316,20 @@ class ActionInferenceSession:
 
         if video.ndim != 5:
             raise ValueError(f"video must be [B,3,T,H,W], got {tuple(video.shape)}")
-        pixel = video_bcthw_to_pixel_batch(video)
+        pixel = video_bcthw_to_pixel_batch(
+            video,
+            past_action_window_size=int(getattr(self.model, "past_action_window_size", 1)),
+        )
         wrist_pixel = None
         if wrist_video is not None:
             if wrist_video.ndim != 5:
                 raise ValueError(
                     f"wrist_video must be [B,3,T,H,W], got {tuple(wrist_video.shape)}"
                 )
-            wrist_pixel = video_bcthw_to_pixel_batch(wrist_video)
+            wrist_pixel = video_bcthw_to_pixel_batch(
+                wrist_video,
+                past_action_window_size=int(getattr(self.model, "past_action_window_size", 1)),
+            )
         tower = vlm_tower if vlm_tower is not None else self.model.vlm_tower
         processor_obj = getattr(tower, "processor", None)
         if processor_obj is None:
@@ -616,6 +622,45 @@ class ActionInferenceSession:
         pred = zero_unsupervised_action_dims(pred)
         self._update_proprio_history(pred)
         out = pred.squeeze(0) if batch_size == 1 else pred
+        if denormalize and self.processor is not None:
+            if out.ndim == 2:
+                return self.processor.postprocess(out.unsqueeze(0)).squeeze(0)
+            return self.processor.postprocess(out)
+        return out
+
+    @torch.no_grad()
+    def predict_rtc(
+        self,
+        num_frames: int,
+        prev_chunk: torch.Tensor,
+        *,
+        inference_delay: int,
+        execution_horizon: int,
+        schedule: str = "exponential",
+        denormalize: bool = False,
+    ) -> torch.Tensor:
+        """Predict then blend with ``prev_chunk`` using Psi0-style RTC soft mask."""
+        from phi0.inference.rtc import blend_action_chunks_rtc, create_rtc_soft_mask
+
+        new_chunk = self.predict(int(num_frames), denormalize=False)
+        if prev_chunk.ndim == 2:
+            prev = prev_chunk.unsqueeze(0)
+        else:
+            prev = prev_chunk
+        if new_chunk.ndim == 2:
+            new = new_chunk.unsqueeze(0)
+        else:
+            new = new_chunk
+        h = int(new.shape[-2])
+        mask = create_rtc_soft_mask(
+            h,
+            int(inference_delay),
+            int(execution_horizon),
+            schedule=schedule,  # type: ignore[arg-type]
+            device=new.device,
+        )
+        out = blend_action_chunks_rtc(new, prev.to(device=new.device, dtype=new.dtype), mask)
+        out = out.squeeze(0) if out.shape[0] == 1 else out
         if denormalize and self.processor is not None:
             if out.ndim == 2:
                 return self.processor.postprocess(out.unsqueeze(0)).squeeze(0)

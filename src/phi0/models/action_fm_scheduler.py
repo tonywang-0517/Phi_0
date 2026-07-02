@@ -92,3 +92,45 @@ class ActionFlowMatching:
             pred_v = predict_velocity(actions, t_disc)
             actions = actions - dt * pred_v
         return actions
+
+    def denoise_euler_rtc_prefix(
+        self,
+        predict_velocity,
+        *,
+        prev_actions: torch.Tensor,
+        inference_delay: int,
+        initial_state: torch.Tensor | None = None,
+        batch_size: int = 1,
+        seq_len: int = 1,
+        action_dim: int = 1,
+        device: torch.device | str | None = None,
+        dtype: torch.dtype = torch.float32,
+    ) -> torch.Tensor:
+        """Psi0 ``predict_action_with_training_rtc_flow``: freeze first ``d`` steps."""
+        d = int(inference_delay)
+        if d <= 0:
+            raise ValueError("inference_delay must be > 0 for RTC prefix denoise")
+        h = int(prev_actions.shape[-2])
+        if d >= h:
+            raise ValueError(f"inference_delay {d} must be < horizon {h}")
+        if initial_state is None:
+            if device is None:
+                raise ValueError("denoise_euler_rtc_prefix requires device when initial_state is None")
+            actions = torch.randn(
+                int(batch_size), int(seq_len), int(action_dim), device=device, dtype=dtype
+            )
+        else:
+            actions = initial_state.clone()
+        prefix_mask = torch.arange(h, device=actions.device)[None, :] < d
+        prev = prev_actions.to(device=actions.device, dtype=actions.dtype)
+        batch_size = int(actions.shape[0])
+        num_steps = max(1, int(self.cfg.num_inference_timesteps))
+        dt = 1.0 / float(num_steps)
+        for step in range(num_steps):
+            actions = torch.where(prefix_mask[:, :, None], prev, actions)
+            t_cont = 1.0 - step / float(num_steps)
+            t_batch = torch.full((batch_size,), t_cont, device=actions.device, dtype=actions.dtype)
+            t_disc = self.discretize_t(t_batch)
+            pred_v = predict_velocity(actions, t_disc)
+            actions = actions - dt * pred_v
+        return torch.where(prefix_mask[:, :, None], prev, actions)

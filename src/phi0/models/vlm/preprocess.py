@@ -9,6 +9,8 @@ import torch
 from PIL import Image
 from torch.nn.utils.rnn import pad_sequence
 
+QWEN_VL_IMAGE_PATCH_SIZE = 16
+
 try:
     from qwen_vl_utils import process_vision_info
 except ImportError as exc:  # pragma: no cover
@@ -124,7 +126,9 @@ def build_qwenvl_inputs_single(
         ]
     else:
         texts = [chat_text]
-    image_inputs, video_inputs = process_vision_info(messages, image_patch_size=16)
+    image_inputs, video_inputs = process_vision_info(
+        messages, image_patch_size=QWEN_VL_IMAGE_PATCH_SIZE
+    )
     return processor(
         text=texts,
         images=image_inputs,
@@ -372,12 +376,28 @@ def build_vlm_inputs_from_pixel_batch(
     )
 
 
-def video_bcthw_to_pixel_batch(video: torch.Tensor) -> torch.Tensor:
-    """``[B,3,T,H,W]`` in ``[-1,1]`` -> ``[B,1,3,H,W]`` in ``[0,1]`` (last frame)."""
+def video_bcthw_to_pixel_batch(
+    video: torch.Tensor,
+    *,
+    past_action_window_size: int = 1,
+    subsampled_control_indices: Sequence[int] | None = None,
+) -> torch.Tensor:
+    """``[B,3,T,H,W]`` in ``[-1,1]`` -> ``[B,1,3,H,W]`` in ``[0,1]`` (proprio-aligned frame)."""
+    from phi0.models.vlm.contract import (
+        resolve_vlm_observation_frame_index,
+        slice_vlm_observation_pixel,
+    )
+
     if video.ndim != 5:
         raise ValueError(f"Expected [B,3,T,H,W], got {tuple(video.shape)}")
-    frame = (video[:, :, -1] + 1.0) * 0.5
-    return frame.unsqueeze(1)
+    pixel = (video + 1.0) * 0.5
+    pixel = pixel.permute(0, 2, 1, 3, 4).contiguous()
+    fi = resolve_vlm_observation_frame_index(
+        pixel_time=int(pixel.shape[1]),
+        past_action_window_size=int(past_action_window_size),
+        subsampled_control_indices=subsampled_control_indices,
+    )
+    return slice_vlm_observation_pixel(pixel, fi)
 
 
 def build_training_vlm_inputs_from_pixels(

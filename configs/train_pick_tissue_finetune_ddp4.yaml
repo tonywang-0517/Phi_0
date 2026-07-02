@@ -1,0 +1,41 @@
+# @package _global_
+# Pick-tissue valid 512-d unified finetune — 4-GPU DDP.
+
+defaults:
+  - train_full
+  - data: pick_tissue_valid_xperience_unified
+  - override /model: phi0_wholebody_best
+  - _self_
+
+seed: 20260701
+output_dir: ./experiments/pick_tissue_valid_wholebody_best_8k_ddp4
+checkpoint_name: pick_tissue_valid_wholebody_best_act
+max_steps: 8000
+save_every_steps: 4000
+checkpoint_overwrite: true
+auto_resume: false
+save_action_expert_only: true
+save_optimizer: false
+
+batch_size: 8
+num_workers: 8
+prefetch_factor: 6
+dataloader_max_workers_per_rank: 8
+dataloader_max_dataset_copies: 72
+train_cpu_prefetch: 6
+train_gpu_pipeline: true
+train_gpu_pipeline_depth: 3
+mixed_precision: bf16
+distributed: false
+ddp_drop_last: true
+ddp_find_unused_parameters: true
+
+learning_rate: 0.0
+learning_rate_backbone: 0.0
+learning_rate_action: 1.0e-4
+learning_rate_warmup_steps: 500
+learning_rate_scheduler: cosine
+weight_decay: 1.0e-6
+adam_beta1: 0.95
+adam_beta2: 0.999
+repeated_action_steps: 1

@@ -1,0 +1,33 @@
+# 512-d unified finetune: frozen Psi0 VLM + wholebody ACT head (2048/6L).
+defaults:
+  - phi0_full
+  - _self_
+
+raw_action_dim: 512
+freeze_vlm: true
+
+vlm:
+  image_size: [180, 320]
+  img_aug: true  # Psi0 finetune-simple-psi0 style ColorJitter
+  attn_implementation: sdpa
+
+vggt:
+  enabled: false
+vggt_use_full_video: false
+
+action_dit_config:
+  action_cross_attn_mode: interleave_vlm
+
+loss:
+  lambda_video: 0.0
+  lambda_action: 1.0
+  lambda_bone: 0.0
+  lambda_bone_hand: 0.0
+  lambda_bone_dir: 0.0
+  lambda_hand_mse: 0.0
+
+rtc:
+  enabled: false
+  inference_delay: 2
+  execution_horizon: 4
+  schedule: exponential
