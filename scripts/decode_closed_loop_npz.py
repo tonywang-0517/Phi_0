@@ -60,6 +60,11 @@ def decode_observations(
     timestamps = np.asarray(data["timestamp"], dtype=np.float64)
     n = int(data["num_inferences"]) if "num_inferences" in data.files else int(ego.shape[0])
     wrist = np.asarray(data["wrist"], dtype=np.uint8) if "wrist" in data.files else None
+    inference_elapsed_s = (
+        np.asarray(data["inference_elapsed_s"], dtype=np.float64)
+        if "inference_elapsed_s" in data.files
+        else None
+    )
 
     hold_frames = max(1, int(round(float(hold_s) * float(fps))))
     ego_frames: list[np.ndarray] = []
@@ -98,6 +103,11 @@ def decode_observations(
         "duration_s": float(timestamps[-1] - timestamps[0]) if n > 1 else 0.0,
         **written,
     }
+    if inference_elapsed_s is not None and inference_elapsed_s.size:
+        summary["inference_elapsed_s"] = inference_elapsed_s.tolist()
+        summary["inference_elapsed_mean_s"] = float(np.mean(inference_elapsed_s))
+        summary["inference_elapsed_p95_s"] = float(np.percentile(inference_elapsed_s, 95))
+        summary["inference_elapsed_max_s"] = float(np.max(inference_elapsed_s))
     (out_dir / "observations_summary.json").write_text(
         json.dumps(summary, indent=2), encoding="utf-8"
     )

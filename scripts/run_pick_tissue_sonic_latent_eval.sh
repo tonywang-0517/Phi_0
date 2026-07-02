@@ -274,7 +274,10 @@ fi
 # 1) MuJoCo sim + mp4 (defaults match sonic_latent_gt_20260628_030836)
 SIM_EXTRA_ARGS=()
 SIM_EGO_GT="${EGO_MP4}"
-if [[ "${GT_PANEL_LAYOUT}" == "top" ]]; then
+if [[ "${ROBOT_ONLY:-}" == "1" || "${GT_PANEL_LAYOUT}" == "robot" ]]; then
+  SIM_EGO_GT=""
+  SIM_EXTRA_ARGS+=(--camera-host "")
+elif [[ "${GT_PANEL_LAYOUT}" == "top" ]]; then
   SIM_EXTRA_ARGS+=(--gt-panel-layout top --wrist-gt-video "${WRIST_MP4}")
 elif [[ "${GT_PANEL_LAYOUT}" == "sim" ]]; then
   SIM_EGO_GT=""

@@ -122,6 +122,7 @@ class ClosedLoopRecorder:
         self._obs_wrist: list[np.ndarray] = []
         self._obs_control_idx: list[int] = []
         self._obs_timestamp: list[float] = []
+        self._obs_inference_elapsed_s: list[float] = []
         self._has_wrist = False
         self._out_tokens: list[np.ndarray] = []
         self._out_left: list[np.ndarray] = []
@@ -132,10 +133,17 @@ class ClosedLoopRecorder:
         self._out_hand_ramp: list[float] = []
         self._out_timestamp: list[float] = []
 
-    def record_observation(self, obs: ObsSnapshot) -> None:
+    def record_observation(
+        self,
+        obs: ObsSnapshot,
+        *,
+        inference_elapsed_s: float | None = None,
+    ) -> None:
         self._obs_ego.append(np.asarray(obs.ego_hwc, dtype=np.uint8))
         self._obs_control_idx.append(int(obs.control_idx))
         self._obs_timestamp.append(float(obs.timestamp))
+        if inference_elapsed_s is not None:
+            self._obs_inference_elapsed_s.append(float(inference_elapsed_s))
         if obs.wrist_hwc is not None:
             self._has_wrist = True
             self._obs_wrist.append(np.asarray(obs.wrist_hwc, dtype=np.uint8))
@@ -180,13 +188,28 @@ class ClosedLoopRecorder:
             }
             if self._has_wrist and len(self._obs_wrist) == len(self._obs_ego):
                 obs_payload["wrist"] = np.stack(self._obs_wrist, axis=0)
+            if len(self._obs_inference_elapsed_s) == len(self._obs_ego):
+                elapsed = np.asarray(self._obs_inference_elapsed_s, dtype=np.float64)
+                obs_payload["inference_elapsed_s"] = elapsed
             np.savez(obs_path, **obs_payload)
-            logger.info(
-                "saved observations %s (%d inferences, ego %s)",
-                obs_path,
-                len(self._obs_ego),
-                obs_payload["ego"].shape,
-            )
+            if "inference_elapsed_s" in obs_payload:
+                e = obs_payload["inference_elapsed_s"]
+                logger.info(
+                    "saved observations %s (%d inferences, ego %s, infer %.3f/%.3f/%.3fs mean/p95/max)",
+                    obs_path,
+                    len(self._obs_ego),
+                    obs_payload["ego"].shape,
+                    float(np.mean(e)),
+                    float(np.percentile(e, 95)),
+                    float(np.max(e)),
+                )
+            else:
+                logger.info(
+                    "saved observations %s (%d inferences, ego %s)",
+                    obs_path,
+                    len(self._obs_ego),
+                    obs_payload["ego"].shape,
+                )
         else:
             logger.warning("no observations recorded; skip %s", obs_path)
 
@@ -855,9 +878,9 @@ def _inference_worker(
                     "robot proprio active (first g1_debug applied; deploy control loop running)"
                 )
             chunk = result.chunk
-            if recorder is not None:
-                recorder.record_observation(result.obs)
             delay = time.monotonic() - t0
+            if recorder is not None:
+                recorder.record_observation(result.obs, inference_elapsed_s=delay)
             logger.info(
                 "inference done horizon=%d token0=%+.3f elapsed=%.3fs ctrl=%d",
                 chunk.horizon,

@@ -35,6 +35,7 @@ from phi0.inference.session import ActionInferenceSession  # noqa: E402
 from phi0_sonic_closed_loop_zmq import (  # noqa: E402
     ActionChunk,
     ClosedLoopRecorder,
+    ObsSnapshot,
     _frame_to_bcthw,
     _load_model_bundle,
     _rgb_to_chw,
@@ -178,16 +179,26 @@ def rollout_offline(
             delay = float(inference_latency_s)
             if inference_latency_s < 0:
                 delay = max(0.0, time.monotonic() - infer_t0)
+            recorder.record_observation(
+                ObsSnapshot(
+                    control_idx=int(ctrl),
+                    ego_hwc=recorded.ego[obs_i],
+                    wrist_hwc=None if recorded.wrist is None else recorded.wrist[obs_i],
+                    timestamp=time.monotonic(),
+                ),
+                inference_elapsed_s=delay,
+            )
             action_chunk_index = calculate_latency_compensated_index(
                 delay,
                 float(control_fps),
                 int(chunk_h),
             )
             logger.info(
-                "infer obs=%d ctrl=%d chunk_i=%d token0=%+.3f",
+                "infer obs=%d ctrl=%d chunk_i=%d elapsed=%.3fs token0=%+.3f",
                 obs_i,
                 ctrl,
                 action_chunk_index,
+                delay,
                 float(cached_chunk.tokens[action_chunk_index, 0]),
             )
 
